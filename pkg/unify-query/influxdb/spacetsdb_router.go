@@ -89,7 +89,12 @@ type BatchItemMeta struct {
 }
 
 func (m *BatchItemMeta) Print() string {
-	return fmt.Sprintf("Meta{key=%s, origin=%s, update=%s}", m.key, string(m.originBytes), string(m.updateBytes))
+	return fmt.Sprintf("Meta{key=%s, originLength=%d, updateLength=%d, origin=%s, update=%s}",
+		m.key, len(m.originBytes), len(m.updateBytes), string(m.originBytes), string(m.updateBytes))
+}
+
+func (m *BatchItemMeta) IsNew() bool {
+	return len(m.originBytes) == 0
 }
 
 func (r *SpaceTsDbRouter) BatchAdd(ctx context.Context, stoPrefix string, entities []influxdb.GenericKV, once bool, printBytes bool) error {
