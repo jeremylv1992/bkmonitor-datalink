@@ -95,6 +95,11 @@ func (s *Service) Reload(ctx context.Context) {
 		log.Errorf(context.TODO(), "start loop reload downsampled info failed,err:%s", err)
 	}
 
+	err = s.loopReloadVMClusterInfo(s.ctx)
+	if err != nil {
+		log.Errorf(context.TODO(), "start loop reload vm cluster info failed,err:%s", err)
+	}
+
 	err = s.reloadSpaceRouter(s.ctx)
 	if err != nil {
 		log.Errorf(context.TODO(), "start loop reload space router failed,err:%s", err)
@@ -495,6 +500,39 @@ func (s *Service) loopReloadDownsampledInfo(ctx context.Context) error {
 				err = consul.LoadDownsampledInfo()
 				if err != nil {
 					log.Errorf(context.TODO(), "reload downsampled info failed, err: %s", err)
+				}
+			}
+		}
+	}()
+	return nil
+}
+
+// loopReloadVMClusterInfo 重载 VMClusterInfo
+func (s *Service) loopReloadVMClusterInfo(ctx context.Context) error {
+	var err error
+	err = consul.ReloadVMClusterInfo()
+	if err != nil {
+		log.Errorf(context.TODO(), "reload vm cluster info failed,error:%s", err)
+		return err
+	}
+	ch, err := consul.WatchVMClusterInfo(ctx)
+	if err != nil {
+		return err
+	}
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				log.Warnf(context.TODO(), "vm cluster info reload loop exit")
+				return
+			case <-ch:
+				log.Debugf(context.TODO(), "get vm cluster info changed notify")
+				err = consul.ReloadVMClusterInfo()
+				if err != nil {
+					log.Errorf(context.TODO(), "reload vm cluster info failed, err: %s", err)
 				}
 			}
 		}

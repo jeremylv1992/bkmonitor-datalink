@@ -508,6 +508,52 @@ func (q *Query) ToQueryMetric(ctx context.Context, spaceUid string) (*metadata.Q
 		query.Condition = whereList.String()
 		query.VmCondition = vmWhereList.String()
 
+		if query.StorageID != consul.OfflineDataArchive {
+			if vmCluster, ok := consul.GetCachedVMClusterInfo(clusterName); ok && vmCluster.Readable {
+				if vmCluster.Select.Address == "" {
+					return nil, fmt.Errorf("native vm cluster select address is empty: %s", clusterName)
+				}
+				if vmCluster.Select.APIPrefix == "" {
+					return nil, fmt.Errorf("native vm cluster select api prefix is empty: %s", clusterName)
+				}
+
+				dbLabel := vmCluster.InfluxCompat.DBLabel
+				if dbLabel == "" {
+					dbLabel = "db"
+				}
+				separator := vmCluster.InfluxCompat.MeasurementFieldSeparator
+				if separator == "" {
+					separator = "_"
+				}
+
+				query.NativeVMInflux = true
+				query.NativeVMAddress = vmCluster.Select.Address
+				query.NativeVMAPIPrefix = vmCluster.Select.APIPrefix
+				query.NativeVMSelectUsername = vmCluster.Select.BasicAuth.Username
+				query.NativeVMSelectPassword = vmCluster.Select.BasicAuth.Password
+				query.NativeVMDBLabel = dbLabel
+				query.NativeVMMeasurementFieldSeparator = separator
+				query.NativeVMSkipSingleField = vmCluster.InfluxCompat.SkipSingleField
+				query.NativeVMMatchers = append(query.NativeVMMatchers, queryLabelsMatcher...)
+
+				if len(queryConditions) > 1 || len(filterConditions) > 1 {
+					query.NativeVMUnsupportedOr = true
+				}
+				if len(filterConditions) == 1 {
+					for _, cond := range filterConditions[0] {
+						if len(cond.Value) == 0 {
+							continue
+						}
+						matcher, err := labels.NewMatcher(labels.MatchEqual, cond.DimensionName, cond.Value[0])
+						if err != nil {
+							return nil, err
+						}
+						query.NativeVMMatchers = append(query.NativeVMMatchers, matcher)
+					}
+				}
+			}
+		}
+
 		queryMetric.QueryList = append(queryMetric.QueryList, query)
 
 		trace.InsertStringIntoSpan("query-metric-query", fmt.Sprintf("%+v", query), span)

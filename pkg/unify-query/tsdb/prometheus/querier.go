@@ -30,6 +30,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/trace"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/tsdb"
 	tsDBInfluxdb "github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/tsdb/influxdb"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/tsdb/victoriaMetricsInstance"
 )
 
 const (
@@ -401,11 +402,30 @@ func GetInstance(ctx context.Context, qry *metadata.Query) tsdb.Instance {
 		)
 		return nil
 	}
+	curl := &curl.HttpCurl{Log: log.OtLogger}
+	if qry.NativeVMInflux {
+		// Native VM queries use the dynamic vmselect endpoint from query metadata.
+		// Do not return the cached InfluxDB storage instance for the same storage id.
+		instance = victoriaMetricsInstance.NewInstanceWithAPIPrefixAndBasicAuth(
+			ctx,
+			qry.NativeVMAddress,
+			qry.NativeVMAPIPrefix,
+			qry.NativeVMSelectUsername,
+			qry.NativeVMSelectPassword,
+			storage.Timeout,
+			curl,
+		)
+		trace.InsertStringIntoSpan("instance-type", instance.GetInstanceType(), span)
+		trace.InsertStringIntoSpan("storage-id", qry.StorageID, span)
+		trace.InsertStringIntoSpan("native-vm-influx", "true", span)
+		trace.InsertStringIntoSpan("native-vm-address", qry.NativeVMAddress, span)
+		trace.InsertStringIntoSpan("native-vm-api-prefix", qry.NativeVMAPIPrefix, span)
+		trace.InsertStringIntoSpan("native-vm-select-username", qry.NativeVMSelectUsername, span)
+		return instance
+	}
 	if storage.Instance != nil {
 		return storage.Instance
 	}
-
-	curl := &curl.HttpCurl{Log: log.OtLogger}
 	switch storage.Type {
 	// vm 实例直接在 storage.instance 就有了，无需进到这个逻辑
 	case consul.VictoriaMetricsStorageType:

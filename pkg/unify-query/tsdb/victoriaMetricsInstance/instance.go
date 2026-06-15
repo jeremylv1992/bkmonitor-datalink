@@ -14,8 +14,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -40,7 +42,10 @@ const (
 type Instance struct {
 	ctx context.Context
 
-	address string
+	address   string
+	apiPrefix string
+	username  string
+	password  string
 
 	timeout time.Duration
 	curl    curl.Curl
@@ -56,10 +61,32 @@ func NewInstance(ctx context.Context, address string, timeout time.Duration, cur
 	}
 }
 
+func NewInstanceWithAPIPrefix(ctx context.Context, address, apiPrefix string, timeout time.Duration, curl curl.Curl) *Instance {
+	return NewInstanceWithAPIPrefixAndBasicAuth(ctx, address, apiPrefix, "", "", timeout, curl)
+}
+
+func NewInstanceWithAPIPrefixAndBasicAuth(
+	ctx context.Context, address, apiPrefix, username, password string, timeout time.Duration, curl curl.Curl,
+) *Instance {
+	return &Instance{
+		ctx:       ctx,
+		address:   address,
+		apiPrefix: apiPrefix,
+		username:  username,
+		password:  password,
+		timeout:   timeout,
+		curl:      curl,
+	}
+}
+
 var _ tsdb.Instance = (*Instance)(nil)
 
 func (i *Instance) urlPath(name, params string) string {
-	urlPath := fmt.Sprintf("%s/%s", i.address, name)
+	urlPath := strings.TrimRight(i.address, "/")
+	if i.apiPrefix != "" {
+		urlPath = fmt.Sprintf("%s/%s", urlPath, strings.Trim(i.apiPrefix, "/"))
+	}
+	urlPath = fmt.Sprintf("%s/%s", urlPath, strings.TrimLeft(name, "/"))
 	if params != "" {
 		urlPath = fmt.Sprintf("%s?%s", urlPath, params)
 	}
@@ -155,6 +182,73 @@ func (i *Instance) matrixFormat(data *Data, span oleltrace.Span) promql.Matrix {
 	return matrix
 }
 
+func (i *Instance) vectorFormat(data *Data, span oleltrace.Span) promql.Vector {
+	vector := make(promql.Vector, 0, len(data.Data.Result))
+	for _, series := range data.Data.Result {
+		if len(series.Value) != 2 {
+			continue
+		}
+
+		var (
+			nt  int64
+			nv  float64
+			err error
+		)
+		switch pt := series.Value[0].(type) {
+		case float64:
+			nt = int64(pt) * 1e3
+		default:
+			continue
+		}
+		switch pv := series.Value[1].(type) {
+		case string:
+			nv, err = strconv.ParseFloat(pv, 64)
+			if err != nil {
+				continue
+			}
+		default:
+			continue
+		}
+
+		metricIndex := 0
+		metric := make(labels.Labels, len(series.Metric))
+		for name, value := range series.Metric {
+			metric[metricIndex] = labels.Label{
+				Name:  name,
+				Value: value,
+			}
+			metricIndex++
+		}
+		vector = append(vector, promql.Sample{
+			Metric: metric,
+			Point: promql.Point{
+				T: nt,
+				V: nv,
+			},
+		})
+	}
+
+	trace.InsertIntIntoSpan("resp-series-num", len(vector), span)
+	trace.InsertIntIntoSpan("resp-point-num", len(vector), span)
+	return vector
+}
+
+func (i *Instance) decodeData(resp *http.Response) (*Data, error) {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("victoria metrics http status: %d", resp.StatusCode)
+	}
+
+	data := &Data{}
+	err := json.NewDecoder(resp.Body).Decode(data)
+	if err != nil {
+		return nil, err
+	}
+	if data.Status != "success" {
+		return nil, errors.New(data.Error)
+	}
+	return data, nil
+}
+
 // QueryRange 查询范围数据
 func (i *Instance) QueryRange(
 	ctx context.Context, promqlStr string,
@@ -193,7 +287,9 @@ func (i *Instance) QueryRange(
 	resp, err := i.curl.Request(
 		ctx, curl.Get,
 		curl.Options{
-			UrlPath: urlPath,
+			UrlPath:  urlPath,
+			UserName: i.username,
+			Password: i.password,
 		},
 	)
 	if err != nil {
@@ -203,13 +299,9 @@ func (i *Instance) QueryRange(
 
 	trace.InsertStringIntoSpan("query-cost", time.Since(startAnaylize).String(), span)
 
-	data := &Data{}
-	err = json.NewDecoder(resp.Body).Decode(data)
+	data, err := i.decodeData(resp)
 	if err != nil {
 		return nil, err
-	}
-	if data.Status != "success" {
-		return nil, errors.New(data.Error)
 	}
 
 	return i.matrixFormat(data, span), err
@@ -220,7 +312,55 @@ func (i *Instance) Query(
 	ctx context.Context, promqlStr string,
 	end time.Time,
 ) (promql.Vector, error) {
-	panic("implement me")
+	var (
+		cancel        context.CancelFunc
+		span          oleltrace.Span
+		startAnaylize time.Time
+
+		err error
+	)
+
+	ctx, span = trace.IntoContext(ctx, trace.TracerName, "victoria-metrics-query")
+	if span != nil {
+		defer span.End()
+	}
+	values := &url.Values{}
+	values.Set("query", promqlStr)
+	values.Set("time", fmt.Sprintf("%d", end.Unix()))
+	urlPath := i.urlPath("query", values.Encode())
+
+	ctx, cancel = context.WithTimeout(ctx, i.timeout)
+	defer cancel()
+	startAnaylize = time.Now()
+
+	trace.InsertStringIntoSpan("query-url-path", urlPath, span)
+	trace.InsertStringIntoSpan("query-promql", promqlStr, span)
+	log.Infof(ctx,
+		"victoria metrics query: %s, promql: %s",
+		urlPath, promqlStr,
+	)
+
+	resp, err := i.curl.Request(
+		ctx, curl.Get,
+		curl.Options{
+			UrlPath:  urlPath,
+			UserName: i.username,
+			Password: i.password,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	trace.InsertStringIntoSpan("query-cost", time.Since(startAnaylize).String(), span)
+
+	data, err := i.decodeData(resp)
+	if err != nil {
+		return nil, err
+	}
+
+	return i.vectorFormat(data, span), err
 }
 
 func (i *Instance) QueryExemplar(ctx context.Context, fields []string, query *metadata.Query, start, end time.Time, matchers ...*labels.Matcher) (*decoder.Response, error) {

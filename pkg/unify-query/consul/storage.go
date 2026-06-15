@@ -24,10 +24,11 @@ var (
 
 // Storage
 type Storage struct {
-	Address  string `json:"address"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Type     string `json:"type"`
+	Address  string            `json:"address"`
+	Username string            `json:"username"`
+	Password string            `json:"password"`
+	Type     string            `json:"type"`
+	Options  map[string]string `json:"options,omitempty"`
 }
 
 // FormatESStorageInfo :

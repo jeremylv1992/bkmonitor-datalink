@@ -22,8 +22,10 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb/decoder"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
@@ -72,7 +74,7 @@ func (i instance) QueryRange(ctx context.Context, promql string, start, end time
 	return nil, nil
 }
 
-func (i instance) Query(ctx context.Context, promql string, end time.Time, step time.Duration) (promql.Matrix, error) {
+func (i instance) Query(ctx context.Context, promql string, end time.Time) (promql.Vector, error) {
 	return nil, nil
 }
 
@@ -188,6 +190,31 @@ func fakeData(ctx context.Context) {
 	})
 }
 
+func TestGetInstanceNativeVMInfluxBypassesCachedStorageInstance(t *testing.T) {
+	log.InitTestLogger()
+	storageID := "native-vm-influx-cached-storage"
+	tsdb.SetStorage(storageID, &tsdb.Storage{
+		Type:     consul.InfluxDBStorageType,
+		Timeout:  time.Second,
+		Instance: instance{name: "cached-influx"},
+	})
+
+	ins := GetInstance(context.Background(), &metadata.Query{
+		StorageID:         storageID,
+		NativeVMInflux:    true,
+		NativeVMAddress:   "http://vmselect:8481",
+		NativeVMAPIPrefix: "/select/0/prometheus/api/v1",
+		NativeVMDBLabel:   "db",
+		ClusterName:       "default",
+		DB:                "system",
+		Measurement:       "cpu_summary",
+		Field:             "usage",
+	})
+
+	require.NotNil(t, ins)
+	assert.Equal(t, consul.VictoriaMetricsStorageType, ins.GetInstanceType())
+}
+
 func TestQueryRange(t *testing.T) {
 	log.InitTestLogger()
 	rootCtx := context.Background()
@@ -201,7 +228,7 @@ func TestQueryRange(t *testing.T) {
 	ins := NewInstance(rootCtx, engine, &QueryRangeStorage{
 		QueryMaxRouting: 100,
 		Timeout:         timeout,
-	})
+	}, 0)
 
 	fakeData(rootCtx)
 	testCases := map[string]struct {

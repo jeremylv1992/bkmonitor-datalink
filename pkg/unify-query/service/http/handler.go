@@ -203,27 +203,32 @@ func queryTs(ctx context.Context, query *structured.QueryTs) (interface{}, error
 
 	referenceNameMetric := make(map[string]string, len(query.QueryList))
 	referenceNameLabelMatcher := make(map[string][]*labels.Matcher, len(query.QueryList))
+	var (
+		vmExpand       *metadata.VmExpand
+		nativeVMExpand *metadata.NativeVMInfluxExpand
+	)
 
 	// 判断是否是直查
-	ok, vmExpand, err := queryReference.CheckVmQuery(ctx)
+	nativeOK, nativeVMExpand, err := queryReference.CheckNativeVMInfluxQuery(ctx)
 	if err != nil {
-		log.Errorf(ctx, fmt.Sprintf("check vm query: %s", err.Error()))
+		log.Errorf(ctx, fmt.Sprintf("check native vm influx query: %s", err.Error()))
+		return nil, err
 	}
-	if ok {
-		if err != nil {
-			return nil, err
-		}
-		if !metadata.GetVMQueryOrFeatureFlag(ctx) {
-			referenceNameMetric = vmExpand.MetricAliasMapping
-			referenceNameLabelMatcher = vmExpand.LabelsMatcher
-		}
+	if nativeOK {
+		referenceNameMetric = nativeVMExpand.MetricAliasMapping
+		referenceNameLabelMatcher = nativeVMExpand.LabelsMatcher
 
-		metadata.SetExpand(ctx, vmExpand)
+		metadata.SetExpand(ctx, nativeVMExpand)
 		instance = prometheus.GetInstance(ctx, &metadata.Query{
-			StorageID: consul.VictoriaMetricsStorageType,
+			NativeVMInflux:         true,
+			StorageID:              nativeVMExpand.StorageID,
+			NativeVMAddress:        nativeVMExpand.Address,
+			NativeVMAPIPrefix:      nativeVMExpand.APIPrefix,
+			NativeVMSelectUsername: nativeVMExpand.SelectUsername,
+			NativeVMSelectPassword: nativeVMExpand.SelectPassword,
 		})
 		if instance == nil {
-			err = fmt.Errorf("%s storage get error", consul.VictoriaMetricsStorageType)
+			err = fmt.Errorf("%s storage get error", nativeVMExpand.StorageID)
 			return nil, err
 		}
 
@@ -235,19 +240,50 @@ func queryTs(ctx context.Context, query *structured.QueryTs) (interface{}, error
 			}
 		}
 	} else {
-		err = metadata.SetQueryReference(ctx, queryReference)
-
+		ok, vmExpand, err := queryReference.CheckVmQuery(ctx)
 		if err != nil {
-			return nil, err
+			log.Errorf(ctx, fmt.Sprintf("check vm query: %s", err.Error()))
 		}
+		if ok {
+			if err != nil {
+				return nil, err
+			}
+			if !metadata.GetVMQueryOrFeatureFlag(ctx) {
+				referenceNameMetric = vmExpand.MetricAliasMapping
+				referenceNameLabelMatcher = vmExpand.LabelsMatcher
+			}
 
-		trace.InsertIntIntoSpan("query-max-routing", QueryMaxRouting, span)
-		trace.InsertStringIntoSpan("singleflight-timeout", SingleflightTimeout.String(), span)
+			metadata.SetExpand(ctx, vmExpand)
+			instance = prometheus.GetInstance(ctx, &metadata.Query{
+				StorageID: consul.VictoriaMetricsStorageType,
+			})
+			if instance == nil {
+				err = fmt.Errorf("%s storage get error", consul.VictoriaMetricsStorageType)
+				return nil, err
+			}
 
-		instance = prometheus.NewInstance(ctx, promql.GlobalEngine, &prometheus.QueryRangeStorage{
-			QueryMaxRouting: QueryMaxRouting,
-			Timeout:         SingleflightTimeout,
-		}, lookBackDelta)
+			for _, ref := range queryReference {
+				for _, qry := range ref.QueryList {
+					metric.TsDBAndTableIDRequestCountInc(
+						ctx, user.SpaceUid, qry.TableID, instance.GetInstanceType(), "query_ts",
+					)
+				}
+			}
+		} else {
+			err = metadata.SetQueryReference(ctx, queryReference)
+
+			if err != nil {
+				return nil, err
+			}
+
+			trace.InsertIntIntoSpan("query-max-routing", QueryMaxRouting, span)
+			trace.InsertStringIntoSpan("singleflight-timeout", SingleflightTimeout.String(), span)
+
+			instance = prometheus.NewInstance(ctx, promql.GlobalEngine, &prometheus.QueryRangeStorage{
+				QueryMaxRouting: QueryMaxRouting,
+				Timeout:         SingleflightTimeout,
+			}, lookBackDelta)
+		}
 	}
 
 	promQL, err = query.ToPromExpr(ctx, referenceNameMetric, referenceNameLabelMatcher)
@@ -256,6 +292,7 @@ func queryTs(ctx context.Context, query *structured.QueryTs) (interface{}, error
 	}
 
 	trace.InsertStringIntoSpan("vm-expand", fmt.Sprintf("%+v", vmExpand), span)
+	trace.InsertStringIntoSpan("native-vm-expand", fmt.Sprintf("%+v", nativeVMExpand), span)
 	trace.InsertStringIntoSpan("storage-type", instance.GetInstanceType(), span)
 
 	if query.Instant {
@@ -698,5 +735,11 @@ func HandleInfluxDBPrint(c *gin.Context) {
 	refresh := c.Query("refresh")
 
 	res := influxdbRouter.GetInfluxDBRouter().Print(ctx, refresh != "")
+	vmClusterInfo, err := json.Marshal(consul.GetCachedVMClusterInfoSnapshot())
+	if err != nil {
+		res += fmt.Sprintf("vmcluster_info => marshal error: %s\n", err.Error())
+	} else {
+		res += fmt.Sprintf("vmcluster_info => %s\n", vmClusterInfo)
+	}
 	c.String(200, res)
 }

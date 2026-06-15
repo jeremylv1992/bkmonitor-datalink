@@ -11,142 +11,98 @@ package victoriaMetricsInstance
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/curl"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 )
 
 const (
-	TestTime  = "2022-11-28 10:00:00"
-	ParseTime = "2006-01-02 15:04:05"
+	testTime  = "2022-11-28 10:00:00"
+	parseTime = "2006-01-02 15:04:05"
 )
 
-func TestInstance_Query_Url(t *testing.T) {
+func TestInstanceQueryRangeUsesNativeVMSelectPrefix(t *testing.T) {
 	log.InitTestLogger()
+	ctx := context.Background()
+	endTime, _ := time.ParseInLocation(parseTime, testTime, time.Local)
+	startTime := endTime.Add(-5 * time.Minute)
 
 	mockCurl := curl.NewMockCurl(map[string]string{
-		`http://127.0.0.1/api/query?query=count%28container_cpu_system_seconds_total_value%29&step=60&time=1669600800`:                                                          `{"status":"success","isPartial":false,"data":{"resultType":"vector","result":[{"metric":{},"value":[1669600800,"31949"]}]}}`,
-		`http://127.0.0.1/api/query?query=count+by+%28__bk_db__%2C+bk_biz_id%2C+bcs_cluster_id%29+%28container_cpu_system_seconds_total_value%7B%7D%29&step=60&time=1669600800`: `{"status":"success","isPartial":false,"data":{"resultType":"vector","result":[{"metric":{"__bk_db__":"mydb","bcs_cluster_id":"BCS-K8S-40949","bk_biz_id":"930"},"value":[1669600800,"31949"]}]}}`,
-		`http://127.0.0.1/api/query?query=sum%28111gggggggggggggggg11&step=60&time=1669600800`:                                                                                  `{"status":"error","errorType":"422","error":"error when executing query=\"sum(111gggggggggggggggg11\" for (time=1669600800000, step=60000): argList: unexpected token \"gggggggggggggggg11\"; want \",\", \")\"; unparsed data: \"gggggggggggggggg11\""}`,
-		`http://127.0.0.1/api/query?query=top%28sum%28kube_pod_container_resource_limits_value%29%29&step=60&time=1669600800`:                                                   `{"status":"error","errorType":"422","error":"unknown func \"top\""}`,
+		`http://127.0.0.1/select/0/prometheus/api/v1/query_range?end=1669600800&query=%7B__name__%3D%22cpu_detail_usage%22%2Cdb%3D%22system%22%7D&start=1669600500&step=60`: `{"status":"success","isPartial":false,"data":{"resultType":"matrix","result":[{"metric":{"db":"system"},"values":[[1669600500,"1.23"],[1669600560,"2.34"]]}]}}`,
 	}, log.OtLogger)
 
-	ctx := context.Background()
-	ins := &Instance{
-		ctx:     ctx,
-		address: "http://127.0.0.1/api",
-		timeout: time.Minute,
-		curl:    mockCurl,
-	}
-
-	endTime, _ := time.ParseInLocation(ParseTime, TestTime, time.Local)
-	stepTime := time.Minute
-
-	testCases := map[string]struct {
-		promql   string
-		expected string
-		err      error
-	}{
-		"count": {
-			promql:   `count(container_cpu_system_seconds_total_value)`,
-			expected: `[{"metric":{},"values":[[1669600800,"31949"]]}]`,
-		},
-		"count rate metric": {
-			promql:   `count by (__bk_db__, bk_biz_id, bcs_cluster_id) (container_cpu_system_seconds_total_value{})`,
-			expected: `[{"metric":{"__bk_db__":"mydb","bcs_cluster_id":"BCS-K8S-40949","bk_biz_id":"930"},"values":[[1669600800,"31949"]]}]`,
-		},
-		"error metric 1": {
-			promql: `sum(111gggggggggggggggg11`,
-			err:    errors.New(`error when executing query="sum(111gggggggggggggggg11" for (time=1669600800000, step=60000): argList: unexpected token "gggggggggggggggg11"; want ",", ")"; unparsed data: "gggggggggggggggg11"`),
-		},
-		"error metric 2": {
-			promql: `top(sum(kube_pod_container_resource_limits_value))`,
-			err:    errors.New(`unknown func "top"`),
-		},
-	}
-
-	for name, c := range testCases {
-		t.Run(name, func(t *testing.T) {
-			data, err := ins.Query(ctx, c.promql, endTime, stepTime)
-			if c.err != nil {
-				assert.Equal(t, c.err, err)
-			} else {
-				assert.Nil(t, err)
-				res, err1 := json.Marshal(data)
-				assert.Nil(t, err1)
-				assert.Equal(t, c.expected, string(res))
-			}
-
-		})
-	}
+	ins := NewInstanceWithAPIPrefix(
+		ctx, "http://127.0.0.1", "/select/0/prometheus/api/v1", time.Minute, mockCurl,
+	)
+	matrix, err := ins.QueryRange(
+		ctx, `{__name__="cpu_detail_usage",db="system"}`, startTime, endTime, time.Minute,
+	)
+	require.NoError(t, err)
+	require.Len(t, matrix, 1)
+	assert.Equal(t, "system", matrix[0].Metric.Get("db"))
+	require.Len(t, matrix[0].Points, 2)
+	assert.Equal(t, 1.23, matrix[0].Points[0].V)
+	assert.Equal(t, int64(1669600500000), matrix[0].Points[0].T)
 }
 
-func TestInstance_QueryRange_Url(t *testing.T) {
+func TestInstanceQueryRangeUsesBasicAuth(t *testing.T) {
 	log.InitTestLogger()
 	ctx := context.Background()
+	endTime, _ := time.ParseInLocation(parseTime, testTime, time.Local)
+	startTime := endTime.Add(-5 * time.Minute)
 
 	mockCurl := curl.NewMockCurl(map[string]string{
-		`http://127.0.0.1/api/query_range?end=1669600800&query=count%28kube_pod_container_resource_limits_value%29&start=1669600500&step=60`:                                                          `{"status":"success","isPartial":false,"data":{"resultType":"matrix","result":[{"metric":{},"values":[[1669600500,"61305"],[1669600560,"61305"],[1669600620,"61305"],[1669600680,"61311"],[1669600740,"61311"],[1669600800,"61314"]]}]}}`,
-		`http://127.0.0.1/api/query_range?end=1669600800&query=count+by+%28__bk_db__%2C+bk_biz_id%2C+bcs_cluster_id%29+%28container_cpu_system_seconds_total_value%7B%7D%29&start=1669600500&step=60`: `{"status":"success","isPartial":false,"data":{"resultType":"matrix","result":[{"metric":{"__bk_db__":"mydb","bcs_cluster_id":"BCS-K8S-40949","bk_biz_id":"930"},"values":[[1669600500,"31949"],[1669600560,"31949"],[1669600620,"31949"],[1669600680,"31949"],[1669600740,"31949"],[1669600800,"31949"]]}]}}`,
-		`http://127.0.0.1/api/query_range?end=1669600800&query=sum%28111gggggggggggggggg11&start=1669600500&step=60`:                                                                                  `{"status":"error","errorType":"422","error":"error when executing query=\"sum(111gggggggggggggggg11\" on the time range (start=1669600500000, end=1669600800000, step=60000): argList: unexpected token \"gggggggggggggggg11\"; want \",\", \")\"; unparsed data: \"gggggggggggggggg11\""}`,
-		`http://127.0.0.1/api/query_range?end=1669600800&query=top%28sum%28kube_pod_container_resource_limits_value%29%29&start=1669600500&step=60`:                                                   `{"status":"error","errorType":"422","error":"unknown func \"top\""}`,
+		`http://127.0.0.1/select/0/prometheus/api/v1/query_range?end=1669600800&query=%7B__name__%3D%22cpu_detail_usage%22%2Cdb%3D%22system%22%7D&start=1669600500&step=60`: `{"status":"success","isPartial":false,"data":{"resultType":"matrix","result":[{"metric":{"db":"system"},"values":[[1669600500,"1.23"]]}]}}`,
 	}, log.OtLogger)
 
-	ins := &Instance{
-		ctx:     ctx,
-		address: "http://127.0.0.1/api",
-		timeout: time.Minute,
-		curl:    mockCurl,
-	}
+	ins := NewInstanceWithAPIPrefixAndBasicAuth(
+		ctx, "http://127.0.0.1", "/select/0/prometheus/api/v1", "query", "secret", time.Minute, mockCurl,
+	)
+	_, err := ins.QueryRange(
+		ctx, `{__name__="cpu_detail_usage",db="system"}`, startTime, endTime, time.Minute,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "query", mockCurl.UserName)
+	assert.Equal(t, "secret", mockCurl.Password)
+}
 
-	leftTime := time.Minute * -5
+func TestInstanceQueryUsesNativeVMSelectPrefix(t *testing.T) {
+	log.InitTestLogger()
+	ctx := context.Background()
+	endTime, _ := time.ParseInLocation(parseTime, testTime, time.Local)
 
-	endTime, _ := time.ParseInLocation(ParseTime, TestTime, time.Local)
-	startTime := endTime.Add(leftTime)
-	stepTime := time.Minute
+	mockCurl := curl.NewMockCurl(map[string]string{
+		`http://127.0.0.1/select/0/prometheus/api/v1/query?query=%7B__name__%3D%22cpu_detail_usage%22%2Cdb%3D%22system%22%7D&time=1669600800`: `{"status":"success","isPartial":false,"data":{"resultType":"vector","result":[{"metric":{"db":"system"},"value":[1669600800,"3.45"]}]}}`,
+	}, log.OtLogger)
 
-	testCases := map[string]struct {
-		promql   string
-		expected string
-		err      error
-	}{
-		"count": {
-			promql:   `count(kube_pod_container_resource_limits_value)`,
-			expected: `[{"metric":{},"values":[[1669600500,"61305"],[1669600560,"61305"],[1669600620,"61305"],[1669600680,"61311"],[1669600740,"61311"],[1669600800,"61314"]]}]`,
-		},
-		"count rate metric": {
-			promql:   `count by (__bk_db__, bk_biz_id, bcs_cluster_id) (container_cpu_system_seconds_total_value{})`,
-			expected: `[{"metric":{"__bk_db__":"mydb","bcs_cluster_id":"BCS-K8S-40949","bk_biz_id":"930"},"values":[[1669600500,"31949"],[1669600560,"31949"],[1669600620,"31949"],[1669600680,"31949"],[1669600740,"31949"],[1669600800,"31949"]]}]`,
-		},
-		"error metric 1": {
-			promql: `sum(111gggggggggggggggg11`,
-			err:    errors.New(`error when executing query="sum(111gggggggggggggggg11" on the time range (start=1669600500000, end=1669600800000, step=60000): argList: unexpected token "gggggggggggggggg11"; want ",", ")"; unparsed data: "gggggggggggggggg11"`),
-		},
-		"error metric 2": {
-			promql: `top(sum(kube_pod_container_resource_limits_value))`,
-			err:    errors.New(`unknown func "top"`),
-		},
-	}
+	ins := NewInstanceWithAPIPrefix(
+		ctx, "http://127.0.0.1", "/select/0/prometheus/api/v1", time.Minute, mockCurl,
+	)
+	vector, err := ins.Query(ctx, `{__name__="cpu_detail_usage",db="system"}`, endTime)
+	require.NoError(t, err)
+	require.Len(t, vector, 1)
+	assert.Equal(t, "system", vector[0].Metric.Get("db"))
+	assert.Equal(t, 3.45, vector[0].V)
+	assert.Equal(t, int64(1669600800000), vector[0].T)
+}
 
-	for name, c := range testCases {
-		t.Run(name, func(t *testing.T) {
-			data, err := ins.QueryRange(ctx, c.promql, startTime, endTime, stepTime)
-			if c.err != nil {
-				assert.Equal(t, c.err, err)
-			} else {
-				assert.Nil(t, err)
-				res, err1 := json.Marshal(data)
-				assert.Nil(t, err1)
-				assert.Equal(t, c.expected, string(res))
-			}
+func TestInstanceQueryRangeReturnsVMError(t *testing.T) {
+	log.InitTestLogger()
+	ctx := context.Background()
+	endTime, _ := time.ParseInLocation(parseTime, testTime, time.Local)
+	startTime := endTime.Add(-5 * time.Minute)
 
-		})
-	}
+	mockCurl := curl.NewMockCurl(map[string]string{
+		`http://127.0.0.1/api/query_range?end=1669600800&query=sum%28111&start=1669600500&step=60`: `{"status":"error","errorType":"422","error":"bad query"}`,
+	}, log.OtLogger)
 
+	ins := NewInstance(ctx, "http://127.0.0.1/api", time.Minute, mockCurl)
+	_, err := ins.QueryRange(ctx, `sum(111`, startTime, endTime, time.Minute)
+	assert.Equal(t, errors.New("bad query"), err)
 }

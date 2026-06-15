@@ -11,4 +11,7 @@ go.work
 go.work.sum
 
 *_tmp
+.local/
+.python-version
+tmp/
 /.gtm*

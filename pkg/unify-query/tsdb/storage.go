@@ -12,6 +12,7 @@ package tsdb
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
@@ -21,6 +22,31 @@ var (
 	storageMap  = make(map[string]*Storage)
 	storageLock = new(sync.RWMutex)
 )
+
+const (
+	nativeVMInfluxOptionKey                    = "native_vm_influx"
+	nativeVMTenantOptionKey                    = "native_vm_tenant"
+	nativeVMAPIPrefixOptionKey                 = "native_vm_api_prefix"
+	nativeVMDBLabelOptionKey                   = "native_vm_db_label"
+	nativeVMMeasurementFieldSeparatorOptionKey = "native_vm_measurement_field_separator"
+	nativeVMSkipSingleFieldOptionKey           = "native_vm_skip_single_field"
+)
+
+func storageOption(options map[string]string, key, defaultValue string) string {
+	if options == nil {
+		return defaultValue
+	}
+	value := options[key]
+	if value == "" {
+		return defaultValue
+	}
+	return value
+}
+
+func storageBoolOption(options map[string]string, key string) bool {
+	value, err := strconv.ParseBool(storageOption(options, key, "false"))
+	return err == nil && value
+}
 
 // ReloadTsDBStorage 重新加载存储实例到内存里面
 func ReloadTsDBStorage(ctx context.Context, tsDBs map[string]*consul.Storage, opt *Options) error {
@@ -41,6 +67,14 @@ func ReloadTsDBStorage(ctx context.Context, tsDBs map[string]*consul.Storage, op
 				Timeout: opt.VM.Timeout,
 			}
 		} else {
+			nativeVMInflux := tsDB.Type == consul.InfluxDBStorageType &&
+				storageBoolOption(tsDB.Options, nativeVMInfluxOptionKey)
+			nativeVMTenant := storageOption(tsDB.Options, nativeVMTenantOptionKey, "0")
+			nativeVMAPIPrefix := storageOption(
+				tsDB.Options,
+				nativeVMAPIPrefixOptionKey,
+				fmt.Sprintf("/select/%s/prometheus/api/v1", nativeVMTenant),
+			)
 			storage = &Storage{
 				Type:     tsDB.Type,
 				Address:  tsDB.Address,
@@ -59,6 +93,19 @@ func ReloadTsDBStorage(ctx context.Context, tsDBs map[string]*consul.Storage, op
 				UriPath:        opt.InfluxDB.RawUriPath,
 				Accept:         opt.InfluxDB.Accept,
 				AcceptEncoding: opt.InfluxDB.AcceptEncoding,
+
+				NativeVMInflux:    nativeVMInflux,
+				NativeVMTenant:    nativeVMTenant,
+				NativeVMAPIPrefix: nativeVMAPIPrefix,
+				NativeVMDBLabel: storageOption(
+					tsDB.Options, nativeVMDBLabelOptionKey, "db",
+				),
+				NativeVMMeasurementFieldSeparator: storageOption(
+					tsDB.Options, nativeVMMeasurementFieldSeparatorOptionKey, "_",
+				),
+				NativeVMSkipSingleField: storageBoolOption(
+					tsDB.Options, nativeVMSkipSingleFieldOptionKey,
+				),
 			}
 		}
 

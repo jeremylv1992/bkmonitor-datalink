@@ -35,6 +35,9 @@ type TestCurl struct {
 
 	Url    string
 	Params []byte
+
+	UserName string
+	Password string
 }
 
 func (c *TestCurl) resp(body string) *http.Response {
@@ -55,6 +58,8 @@ func (c *TestCurl) Request(ctx context.Context, method string, opt Options) (*ht
 
 	c.Url = opt.UrlPath
 	c.Params = opt.Body
+	c.UserName = opt.UserName
+	c.Password = opt.Password
 
 	if res, ok := c.data[opt.UrlPath]; ok {
 		return c.resp(res), nil

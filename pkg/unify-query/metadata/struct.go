@@ -77,6 +77,18 @@ type Query struct {
 
 	Filters []map[string]string // 查询中自带查询条件，用于拼接
 
+	NativeVMInflux                    bool
+	NativeVMAddress                   string
+	NativeVMTenant                    string
+	NativeVMAPIPrefix                 string
+	NativeVMSelectUsername            string
+	NativeVMSelectPassword            string
+	NativeVMDBLabel                   string
+	NativeVMMeasurementFieldSeparator string
+	NativeVMSkipSingleField           bool
+	NativeVMMatchers                  []*labels.Matcher
+	NativeVMUnsupportedOr             bool
+
 	OffsetInfo OffSetInfo // limit等偏移量配置
 
 	SegmentedEnable bool // 是否开启分段查询
