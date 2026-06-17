@@ -101,12 +101,13 @@ class ReplayRequest(object):
 
 
 class ResponseResult(object):
-    def __init__(self, status_code, headers, body, elapsed_ms, error=None):
+    def __init__(self, status_code, headers, body, elapsed_ms, error=None, replay_headers=None):
         self.status_code = status_code
         self.headers = headers
         self.body = body
         self.elapsed_ms = elapsed_ms
         self.error = error
+        self.replay_headers = replay_headers or {}
 
 
 class RawRecord(object):
@@ -337,39 +338,47 @@ def new_traceparent():
     return "00-%s-%s-01" % (random_hex(16), random_hex(8))
 
 
-def build_replay_headers(headers):
+def new_request_id():
+    return random_hex(16)
+
+
+def build_replay_headers(headers, request_id=None, traceparent=None):
     replay_headers = {}
     for key, value in headers.items():
         lowered = key.lower()
         if lowered in HOP_BY_HOP_HEADERS or lowered in TRACE_CONTEXT_HEADERS:
             continue
         replay_headers[key] = value
+    request_id = request_id or new_request_id()
     replay_headers[SHADOW_REPLAY_HEADER] = SHADOW_REPLAY_VALUE
-    replay_headers["Traceparent"] = new_traceparent()
+    replay_headers["Traceparent"] = traceparent or new_traceparent()
+    replay_headers["X-Request-Id"] = request_id
+    replay_headers["X-Bkapi-Trace-Id"] = request_id
     return replay_headers
 
 
-def send_request(replay, base_url, timeout):
+def send_request(replay, base_url, timeout, replay_headers=None):
     url = build_url(base_url, replay.path)
     data = replay.body if replay.method not in {"GET", "HEAD"} else None
     start = time.perf_counter() if hasattr(time, "perf_counter") else time.time()
     req = Request(url=url, data=data, method=replay.method)
-    for key, value in build_replay_headers(replay.headers).items():
+    replay_headers = replay_headers or build_replay_headers(replay.headers)
+    for key, value in replay_headers.items():
         req.add_header(key, value)
 
     try:
         with urlopen(req, timeout=timeout) as resp:
             body = resp.read()
             elapsed_ms = elapsed_since_ms(start)
-            return ResponseResult(resp.status, dict(resp.headers.items()), body, elapsed_ms)
+            return ResponseResult(resp.status, dict(resp.headers.items()), body, elapsed_ms, replay_headers=replay_headers)
     except HTTPError as err:
         body = err.read()
         elapsed_ms = elapsed_since_ms(start)
-        return ResponseResult(err.code, dict(err.headers.items()), body, elapsed_ms)
+        return ResponseResult(err.code, dict(err.headers.items()), body, elapsed_ms, replay_headers=replay_headers)
     except (URLError, OSError) as err:
-        return ResponseResult(None, {}, b"", elapsed_since_ms(start), error=str(err))
+        return ResponseResult(None, {}, b"", elapsed_since_ms(start), error=str(err), replay_headers=replay_headers)
     except Exception as err:  # pragma: no cover - defensive reporting path.
-        return ResponseResult(None, {}, b"", elapsed_since_ms(start), error="%s\n%s" % (err, traceback.format_exc()))
+        return ResponseResult(None, {}, b"", elapsed_since_ms(start), error="%s\n%s" % (err, traceback.format_exc()), replay_headers=replay_headers)
 
 
 def elapsed_since_ms(start):
@@ -420,6 +429,9 @@ def classify(new, old, absolute_tolerance=1e-9, relative_tolerance=1e-6):
         metric_diff = metric_result_diff(new_json, old_json, absolute_tolerance, relative_tolerance)
         if metric_diff:
             return metric_diff
+        presentation_diff = series_presentation_diff(new_json, old_json)
+        if presentation_diff:
+            return presentation_diff
 
         normalized_new = normalize_json(new_json)
         normalized_old = normalize_json(old_json)
@@ -503,6 +515,39 @@ def metric_result_diff(new_json, old_json, absolute_tolerance, relative_toleranc
     return None
 
 
+def series_presentation_diff(new_json, old_json):
+    new_series = find_series(new_json)
+    old_series = find_series(old_json)
+    if new_series is None or old_series is None:
+        return None
+    if first_json_diff(normalize_json(new_json), normalize_json(old_json), "body") is None:
+        return None
+    if first_json_diff(strip_series_lists(new_json), strip_series_lists(old_json), "body") is not None:
+        return None
+    return CompareResult(
+        False,
+        "series_presentation_mismatch",
+        "body.series",
+        "series are semantically equal after normalizing series/group_keys order and float precision",
+    )
+
+
+def strip_series_lists(value):
+    if isinstance(value, dict):
+        stripped = OrderedDict()
+        for key in sorted(value.keys()):
+            if key in VOLATILE_KEYS:
+                continue
+            if key in ("series", "result", "list") and isinstance(value[key], list):
+                stripped[key] = "__SERIES__"
+            else:
+                stripped[key] = strip_series_lists(value[key])
+        return stripped
+    if isinstance(value, list):
+        return [strip_series_lists(item) for item in value]
+    return value
+
+
 def find_series(value):
     paths = [
         ("data", "result"),
@@ -526,6 +571,13 @@ def find_series(value):
 def series_labels(item):
     if not isinstance(item, dict):
         return {}
+    group_keys = item.get("group_keys")
+    group_values = item.get("group_values")
+    if isinstance(group_keys, list) and isinstance(group_values, list) and len(group_keys) == len(group_values):
+        return OrderedDict(
+            (str(key), normalize_json(group_values[idx]))
+            for idx, key in sorted(enumerate(group_keys), key=lambda pair: str(pair[1]))
+        )
     for key in ("metric", "dimensions", "labels", "target"):
         value = item.get(key)
         if isinstance(value, dict):
@@ -766,6 +818,7 @@ def failure_info(new_resp, old_resp, cmp_result):
 
 
 def response_summary(resp):
+    replay_headers = lower_headers(resp.replay_headers)
     return {
         "status_code": resp.status_code,
         "elapsed_ms": round(resp.elapsed_ms, 3) if resp.elapsed_ms is not None else None,
@@ -773,6 +826,9 @@ def response_summary(resp):
         "body_sha256": sha256_hex(resp.body),
         "body_preview": preview_body(resp.body, 512),
         "error": resp.error,
+        "replay_request_id": replay_headers.get("x-request-id"),
+        "replay_bkapi_trace_id": replay_headers.get("x-bkapi-trace-id"),
+        "replay_traceparent": replay_headers.get("traceparent"),
     }
 
 
@@ -860,15 +916,16 @@ def render_markdown_summary(summary):
 
 def replay_work_item(item, args):
     request = item.request
+    replay_headers = build_replay_headers(request.headers)
     if args.new_mode == "replay":
         with ThreadPoolExecutor(max_workers=2) as executor:
-            new_future = executor.submit(send_request, request, args.new_base, args.new_timeout)
-            old_future = executor.submit(send_request, request, args.old_base, args.old_timeout)
+            new_future = executor.submit(send_request, request, args.new_base, args.new_timeout, replay_headers)
+            old_future = executor.submit(send_request, request, args.old_base, args.old_timeout, replay_headers)
             new_resp = new_future.result()
             old_resp = old_future.result()
     else:
         new_resp = item.new_response
-        old_resp = send_request(request, args.old_base, args.old_timeout)
+        old_resp = send_request(request, args.old_base, args.old_timeout, replay_headers)
     cmp_result = classify(new_resp, old_resp, args.absolute_tolerance, args.relative_tolerance)
     return request, new_resp, old_resp, cmp_result
 

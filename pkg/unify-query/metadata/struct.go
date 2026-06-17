@@ -87,6 +87,7 @@ type Query struct {
 	NativeVMMeasurementFieldSeparator string
 	NativeVMSkipSingleField           bool
 	NativeVMMatchers                  []*labels.Matcher
+	NativeVMMatcherGroups             [][]*labels.Matcher
 	NativeVMUnsupportedOr             bool
 
 	OffsetInfo OffSetInfo // limit等偏移量配置

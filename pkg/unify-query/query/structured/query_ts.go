@@ -536,8 +536,17 @@ func (q *Query) ToQueryMetric(ctx context.Context, spaceUid string) (*metadata.Q
 				query.NativeVMSkipSingleField = vmCluster.InfluxCompat.SkipSingleField
 				query.NativeVMMatchers = append(query.NativeVMMatchers, queryLabelsMatcher...)
 
-				if len(queryConditions) > 1 || len(filterConditions) > 1 {
-					query.NativeVMUnsupportedOr = true
+				queryMatcherGroups, err := conditionGroupsToNativeVMMatchers(queryConditions)
+				if err != nil {
+					return nil, err
+				}
+				filterMatcherGroups, err := conditionGroupsToNativeVMMatchers(filterConditions)
+				if err != nil {
+					return nil, err
+				}
+				query.NativeVMMatcherGroups, err = combineNativeVMMatcherGroups(queryMatcherGroups, filterMatcherGroups)
+				if err != nil {
+					return nil, err
 				}
 				if len(filterConditions) == 1 {
 					for _, cond := range filterConditions[0] {

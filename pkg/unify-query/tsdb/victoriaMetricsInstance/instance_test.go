@@ -12,14 +12,19 @@ package victoriaMetricsInstance
 import (
 	"context"
 	"errors"
+	"net/url"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/curl"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 )
 
 const (
@@ -105,4 +110,126 @@ func TestInstanceQueryRangeReturnsVMError(t *testing.T) {
 	ins := NewInstance(ctx, "http://127.0.0.1/api", time.Minute, mockCurl)
 	_, err := ins.QueryRange(ctx, `sum(111`, startTime, endTime, time.Minute)
 	assert.Equal(t, errors.New("bad query"), err)
+}
+
+func TestInstanceLabelNamesUsesNativeVMLabelsAPI(t *testing.T) {
+	log.InitTestLogger()
+	ctx := context.Background()
+	endTime, _ := time.ParseInLocation(parseTime, testTime, time.Local)
+	startTime := endTime.Add(-5 * time.Minute)
+	query := nativeVMInfoTestQuery(t)
+	selector := `{__name__="cpu_detail_usage",db="system",bk_biz_id="2"}`
+
+	mockCurl := curl.NewMockCurl(map[string]string{
+		nativeVMInfoURL("labels", selector, startTime, endTime): `{"status":"success","data":["bk_biz_id","db","__name__"]}`,
+	}, log.OtLogger)
+
+	ins := NewInstanceWithAPIPrefixAndBasicAuth(
+		ctx, "http://127.0.0.1", "/select/0/prometheus/api/v1", "query", "secret", time.Minute, mockCurl,
+	)
+	names, err := ins.LabelNames(ctx, query, startTime, endTime)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"__name__", "bk_biz_id", "db"}, names)
+	assert.Equal(t, "query", mockCurl.UserName)
+	assert.Equal(t, "secret", mockCurl.Password)
+}
+
+func TestInstanceLabelValuesUsesNativeVMSeriesAPI(t *testing.T) {
+	log.InitTestLogger()
+	ctx := context.Background()
+	endTime, _ := time.ParseInLocation(parseTime, testTime, time.Local)
+	startTime := endTime.Add(-5 * time.Minute)
+	query := nativeVMInfoTestQuery(t)
+	selector := `{__name__="cpu_detail_usage",db="system",bk_biz_id="2"}`
+
+	mockCurl := curl.NewMockCurl(map[string]string{
+		nativeVMInfoURL("series", selector, startTime, endTime): `{"status":"success","data":[{"__name__":"cpu_detail_usage","db":"system","bk_biz_id":"3"},{"__name__":"cpu_detail_usage","db":"system","bk_biz_id":"2"},{"__name__":"cpu_detail_usage","db":"system","bk_biz_id":"2"}]}`,
+	}, log.OtLogger)
+
+	ins := NewInstanceWithAPIPrefix(
+		ctx, "http://127.0.0.1", "/select/0/prometheus/api/v1", time.Minute, mockCurl,
+	)
+	values, err := ins.LabelValues(ctx, query, "bk_biz_id", startTime, endTime)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"2", "3"}, values)
+}
+
+func TestInstanceSeriesUsesNativeVMSeriesAPI(t *testing.T) {
+	log.InitTestLogger()
+	ctx := context.Background()
+	endTime, _ := time.ParseInLocation(parseTime, testTime, time.Local)
+	startTime := endTime.Add(-5 * time.Minute)
+	query := nativeVMInfoTestQuery(t)
+	selector := `{__name__="cpu_detail_usage",db="system",bk_biz_id="2"}`
+
+	mockCurl := curl.NewMockCurl(map[string]string{
+		nativeVMInfoURL("series", selector, startTime, endTime): `{"status":"success","data":[{"__name__":"cpu_detail_usage","db":"system","bk_biz_id":"2"},{"__name__":"cpu_detail_usage","db":"system","bk_biz_id":"3"}]}`,
+	}, log.OtLogger)
+
+	ins := NewInstanceWithAPIPrefix(
+		ctx, "http://127.0.0.1", "/select/0/prometheus/api/v1", time.Minute, mockCurl,
+	)
+	set := ins.Series(ctx, query, startTime, endTime)
+	require.NoError(t, set.Err())
+
+	var got []labels.Labels
+	for set.Next() {
+		got = append(got, set.At().Labels())
+	}
+	require.NoError(t, set.Err())
+	require.Len(t, got, 2)
+	assert.Equal(t, "cpu_detail_usage", got[0].Get(labels.MetricName))
+	assert.Equal(t, "system", got[0].Get("db"))
+	assert.Equal(t, "2", got[0].Get("bk_biz_id"))
+	assert.Equal(t, "3", got[1].Get("bk_biz_id"))
+}
+
+func TestInstanceQueryRawDelegatesSeriesLookup(t *testing.T) {
+	log.InitTestLogger()
+	ctx := context.Background()
+	endTime, _ := time.ParseInLocation(parseTime, testTime, time.Local)
+	startTime := endTime.Add(-5 * time.Minute)
+	query := nativeVMInfoTestQuery(t)
+	selector := `{__name__="cpu_detail_usage",db="system",bk_biz_id="2"}`
+
+	mockCurl := curl.NewMockCurl(map[string]string{
+		nativeVMInfoURL("series", selector, startTime, endTime): `{"status":"success","data":[{"__name__":"cpu_detail_usage","db":"system","bk_biz_id":"2"}]}`,
+	}, log.OtLogger)
+
+	ins := NewInstanceWithAPIPrefix(
+		ctx, "http://127.0.0.1", "/select/0/prometheus/api/v1", time.Minute, mockCurl,
+	)
+	set := ins.QueryRaw(ctx, query, &storage.SelectHints{
+		Start: startTime.UnixMilli(),
+		End:   endTime.UnixMilli(),
+		Func:  "series",
+	})
+	require.NotNil(t, set)
+	require.NoError(t, set.Err())
+	require.True(t, set.Next())
+	assert.Equal(t, "2", set.At().Labels().Get("bk_biz_id"))
+}
+
+func nativeVMInfoTestQuery(t *testing.T) *metadata.Query {
+	t.Helper()
+
+	bizMatcher, err := labels.NewMatcher(labels.MatchEqual, "bk_biz_id", "2")
+	require.NoError(t, err)
+
+	return &metadata.Query{
+		DB:                                "system",
+		Measurement:                       "cpu_detail",
+		Field:                             "usage",
+		NativeVMDBLabel:                   "db",
+		NativeVMMeasurementFieldSeparator: "_",
+		NativeVMMatchers:                  []*labels.Matcher{bizMatcher},
+	}
+}
+
+func nativeVMInfoURL(name, selector string, start, end time.Time) string {
+	values := &url.Values{}
+	values.Set("match[]", selector)
+	values.Set("start", strconv.FormatInt(start.Unix(), 10))
+	values.Set("end", strconv.FormatInt(end.Unix(), 10))
+	return "http://127.0.0.1/select/0/prometheus/api/v1/" + name + "?" + values.Encode()
 }

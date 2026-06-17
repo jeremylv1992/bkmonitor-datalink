@@ -30,3 +30,21 @@ type Data struct {
 		Result     []Series `json:"result"`
 	} `json:"data,omitempty"`
 }
+
+// LabelsData labels metadata API 返回结构体
+type LabelsData struct {
+	Status string `json:"status"`
+
+	ErrorType string   `json:"errorType,omitempty"`
+	Error     string   `json:"error,omitempty"`
+	Data      []string `json:"data,omitempty"`
+}
+
+// SeriesData series metadata API 返回结构体
+type SeriesData struct {
+	Status string `json:"status"`
+
+	ErrorType string   `json:"errorType,omitempty"`
+	Error     string   `json:"error,omitempty"`
+	Data      []Metric `json:"data,omitempty"`
+}

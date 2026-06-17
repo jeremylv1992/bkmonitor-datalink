@@ -10,40 +10,49 @@
 package middleware
 
 import (
-	"log"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 
-	"bou.ke/monkey"
-	"github.com/smartystreets/goconvey/convey"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSingleGetInstance(t *testing.T) {
-	convey.Convey("测试获取实例IP次数是否为单次", t, func() {
-		tests := []struct {
-			name    string
-			mockIPs []string
-			want    string
-		}{
-			// TODO: Add test cases.
-			{
-				"多次调用singleGetInstance函数",
-				[]string{"127.0.0.1", "127.0.0.2", "127.0.0.3"},
-				"127.0.0.1",
-			},
-		}
+	oldOnce := once
+	oldInstancedIP := instancedIP
+	oldGetInstanceipFunc := getInstanceipFunc
+	defer func() {
+		once = oldOnce
+		instancedIP = oldInstancedIP
+		getInstanceipFunc = oldGetInstanceipFunc
+	}()
 
-		for _, tt := range tests {
-			convey.Convey(tt.name, func() {
-				for _, mockIP := range tt.mockIPs {
-					monkey.Patch(getInstanceip, func() (string, error) {
-						return mockIP, nil
-					})
-					got := singleGetInstance()
-					log.Println("mockIP:", mockIP)
-					log.Println("got:", got)
-					convey.So(got, convey.ShouldContainSubstring, tt.want)
-				}
-			})
-		}
-	})
+	var calls int
+	once = sync.Once{}
+	instancedIP = ""
+	getInstanceipFunc = func() (string, error) {
+		calls++
+		return "127.0.0.1", nil
+	}
+
+	assert.Equal(t, "127.0.0.1", singleGetInstance())
+	assert.Equal(t, "127.0.0.1", singleGetInstance())
+	assert.Equal(t, 1, calls)
+}
+
+func TestReadAndRestoreRequestBody(t *testing.T) {
+	const body = `{"query_list":[{"reference_name":"a"}]}`
+
+	req := httptest.NewRequest(http.MethodPost, "/query/ts", strings.NewReader(body))
+	got, err := readAndRestoreRequestBody(req)
+	require.NoError(t, err)
+	assert.Equal(t, body, string(got))
+
+	restored, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	assert.Equal(t, body, string(restored))
 }

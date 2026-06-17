@@ -156,6 +156,43 @@ class LiveShadowCompareTest(unittest.TestCase):
             new_server.stop()
             old_server.stop()
 
+    def test_replay_to_new_and_old_uses_same_generated_request_ids(self):
+        new_server = start_server({"side": "new"})
+        old_server = start_server({"side": "old"})
+        try:
+            args = Args(
+                new_mode="replay",
+                new_base=new_server.url,
+                old_base=old_server.url,
+                new_timeout=2,
+                old_timeout=2,
+                absolute_tolerance=1e-9,
+                relative_tolerance=1e-6,
+            )
+
+            self.mod.replay_work_item(
+                self.mod.WorkItem(
+                    self.sample_request(
+                        headers={
+                            "Content-Type": "application/json",
+                            "X-Request-Id": "original-request",
+                            "X-Bkapi-Trace-Id": "original-bkapi",
+                        }
+                    )
+                ),
+                args,
+            )
+
+            new_req_id = new_server.received_headers["X-Request-Id"]
+            old_req_id = old_server.received_headers["X-Request-Id"]
+            self.assertEqual(new_req_id, old_req_id)
+            self.assertNotEqual(new_req_id, "original-request")
+            self.assertEqual(new_server.received_headers["X-Bkapi-Trace-Id"], new_req_id)
+            self.assertEqual(old_server.received_headers["X-Bkapi-Trace-Id"], new_req_id)
+        finally:
+            new_server.stop()
+            old_server.stop()
+
     def test_replay_headers_replace_original_trace_context(self):
         original = {
             "Content-Type": "application/json",
@@ -173,9 +210,38 @@ class LiveShadowCompareTest(unittest.TestCase):
         self.assertNotEqual(first["Traceparent"], original["Traceparent"])
         self.assertNotEqual(second["Traceparent"], first["Traceparent"])
         self.assertNotIn("Tracestate", first)
-        self.assertNotIn("X-Bkapi-Trace-Id", first)
-        self.assertNotIn("X-Request-Id", first)
+        self.assertIn("X-Bkapi-Trace-Id", first)
+        self.assertIn("X-Request-Id", first)
+        self.assertEqual(first["X-Bkapi-Trace-Id"], first["X-Request-Id"])
+        self.assertNotEqual(first["X-Request-Id"], "original-request")
+        self.assertNotEqual(first["X-Bkapi-Trace-Id"], "original-bkapi-trace")
         self.assertRegex(first["Traceparent"], r"^00-[0-9a-f]{32}-[0-9a-f]{16}-01$")
+
+    def test_classify_series_presentation_only_mismatch(self):
+        new = self.sample_response(body=json.dumps({
+            "series": [
+                {
+                    "group_keys": ["b", "a"],
+                    "group_values": ["2", "1"],
+                    "values": [[1, 1.23456789]],
+                },
+            ],
+        }).encode("utf-8"))
+        old = self.sample_response(body=json.dumps({
+            "series": [
+                {
+                    "group_keys": ["a", "b"],
+                    "group_values": ["1", "2"],
+                    "values": [[1, 1.2345678900001]],
+                },
+            ],
+        }).encode("utf-8"))
+
+        case = self.mod.classify(new, old)
+
+        self.assertFalse(case.equal)
+        self.assertEqual(case.attribution, "series_presentation_mismatch")
+        self.assertEqual(case.diff_path, "body.series")
 
     def test_classify_status_code_mismatch(self):
         case = self.mod.classify(self.sample_response(status=200), self.sample_response(status=404))

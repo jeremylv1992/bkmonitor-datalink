@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -157,7 +158,8 @@ func queryTs(ctx context.Context, query *structured.QueryTs) (interface{}, error
 
 		lookBackDelta time.Duration
 
-		promQL parser.Expr
+		promQL    parser.Expr
+		queryExpr string
 	)
 
 	ctx, span = trace.IntoContext(ctx, trace.TracerName, "query-ts")
@@ -206,15 +208,32 @@ func queryTs(ctx context.Context, query *structured.QueryTs) (interface{}, error
 	var (
 		vmExpand       *metadata.VmExpand
 		nativeVMExpand *metadata.NativeVMInfluxExpand
+		responseStatus *metadata.Status
 	)
 
 	// 判断是否是直查
+	responseStatus = metadata.GetStatus(ctx)
 	nativeOK, nativeVMExpand, err := queryReference.CheckNativeVMInfluxQuery(ctx)
 	if err != nil {
 		log.Errorf(ctx, fmt.Sprintf("check native vm influx query: %s", err.Error()))
 		return nil, err
 	}
 	if nativeOK {
+		missingSelectors, err := query.MissingNativeVMMetricQLSelectors(nativeVMExpand)
+		if err != nil {
+			return nil, err
+		}
+		if len(missingSelectors) > 0 && responseStatus == nil {
+			return nil, fmt.Errorf("native vm selector not found: %s", strings.Join(missingSelectors, ","))
+		}
+		if len(missingSelectors) > 0 {
+			trace.InsertStringIntoSpan("native-vm-missing-selectors", strings.Join(missingSelectors, ","), span)
+			log.Warnf(ctx, "native vm selector missing with metadata status: %s", strings.Join(missingSelectors, ","))
+			for _, referenceName := range missingSelectors {
+				nativeVMExpand.MetricSelector[referenceName] = structured.NativeVMMissingReferenceSelector(referenceName)
+			}
+		}
+
 		referenceNameMetric = nativeVMExpand.MetricAliasMapping
 		referenceNameLabelMatcher = nativeVMExpand.LabelsMatcher
 
@@ -286,7 +305,14 @@ func queryTs(ctx context.Context, query *structured.QueryTs) (interface{}, error
 		}
 	}
 
-	promQL, err = query.ToPromExpr(ctx, referenceNameMetric, referenceNameLabelMatcher)
+	if nativeOK {
+		queryExpr, err = query.ToNativeVMMetricQL(ctx, nativeVMExpand)
+	} else {
+		promQL, err = query.ToPromExpr(ctx, referenceNameMetric, referenceNameLabelMatcher)
+		if err == nil {
+			queryExpr = promQL.String()
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -296,15 +322,15 @@ func queryTs(ctx context.Context, query *structured.QueryTs) (interface{}, error
 	trace.InsertStringIntoSpan("storage-type", instance.GetInstanceType(), span)
 
 	if query.Instant {
-		res, err = instance.Query(ctx, promQL.String(), end)
+		res, err = instance.Query(ctx, queryExpr, end)
 	} else {
-		res, err = instance.QueryRange(ctx, promQL.String(), start, end, step)
+		res, err = instance.QueryRange(ctx, queryExpr, start, end, step)
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	trace.InsertStringIntoSpan("promql", promQL.String(), span)
+	trace.InsertStringIntoSpan("promql", queryExpr, span)
 	trace.InsertStringIntoSpan("start", start.String(), span)
 	trace.InsertStringIntoSpan("end", end.String(), span)
 	trace.InsertStringIntoSpan("step", step.String(), span)
@@ -356,6 +382,10 @@ func queryTs(ctx context.Context, query *structured.QueryTs) (interface{}, error
 	}
 
 	resp.Status = metadata.GetStatus(ctx)
+	if responseStatus != nil {
+		metadata.SetStatus(ctx, responseStatus.Code, responseStatus.Message)
+		resp.Status = responseStatus
+	}
 	return resp, nil
 }
 

@@ -20,7 +20,6 @@ import (
 	omd "github.com/TencentBlueKing/bkmonitor-datalink/pkg/offline-data-archive/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/offline-data-archive/policy/stores/shard"
 	goRedis "github.com/go-redis/redis/v8"
-	"github.com/hashicorp/consul/api"
 	"github.com/prometheus/prometheus/model/labels"
 	promPromql "github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
@@ -28,6 +27,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
+	uqInfluxdb "github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb/decoder"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
@@ -224,43 +224,462 @@ func TestQueryTsNativeVMInfluxUsesInfluxMetadataMetricQL(t *testing.T) {
 	assert.NotContains(t, capturedPromQL, "legacy_vm_rt_should_not_be_used")
 }
 
+func TestQueryTsNativeVMInfluxUsesMetricQLOrSelector(t *testing.T) {
+	ctx := context.Background()
+	log.InitTestLogger()
+	mock.SetOfflineDataArchiveMetadata(&emptyArchiveMetadata{})
+
+	var capturedPromQL string
+	vmselect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPromQL = r.URL.Query().Get("query")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"status":"success","isPartial":false,"data":{"resultType":"matrix","result":[{"metric":{"db":"system"},"values":[[1677081600,"1.23"]]}]}}`)
+	}))
+	t.Cleanup(vmselect.Close)
+	reloadTestNativeVMClusterInfo(t, "cluster-a", vmselect.URL)
+
+	storageID := "native-vm-handler-or-storage"
+	tsdb.SetStorage(storageID, &tsdb.Storage{
+		Type:    consul.InfluxDBStorageType,
+		Address: "http://influxdb-proxy:8080",
+		Timeout: time.Minute,
+	})
+
+	spaceUid := "native-vm-handler-or-space"
+	tableID := "system.cpu_detail"
+	mock.SetSpaceAndProxyMockData(
+		ctx,
+		"native_vm_handler_or_test",
+		"native_vm_handler_or_test",
+		spaceUid,
+		&redis.TsDB{
+			TableID:         tableID,
+			Field:           []string{"usage"},
+			MeasurementType: redis.BKTraditionalMeasurement,
+		},
+		&ir.Proxy{
+			MeasurementType: redis.BKTraditionalMeasurement,
+			StorageID:       storageID,
+			ClusterName:     "cluster-a",
+			Db:              "system",
+			Measurement:     "cpu_detail",
+		},
+	)
+
+	_, err := queryTs(ctx, &structured.QueryTs{
+		SpaceUid: spaceUid,
+		QueryList: []*structured.Query{
+			{
+				TableID:       structured.TableID(tableID),
+				FieldName:     "usage",
+				ReferenceName: "a",
+				Conditions: structured.Conditions{
+					FieldList: []structured.ConditionField{
+						{
+							DimensionName: "bk_biz_id",
+							Operator:      structured.ConditionEqual,
+							Value:         []string{"2"},
+						},
+						{
+							DimensionName: "bk_biz_id",
+							Operator:      structured.ConditionEqual,
+							Value:         []string{"3"},
+						},
+					},
+					ConditionList: []string{structured.ConditionOr},
+				},
+				TimeAggregation: structured.TimeAggregation{
+					Function: "avg_over_time",
+					Window:   "1m",
+				},
+			},
+		},
+		MetricMerge: "a",
+		Start:       "1677081600",
+		End:         "1677081660",
+		Step:        "60s",
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, capturedPromQL, `avg_over_time({`)
+	assert.Contains(
+		t,
+		capturedPromQL,
+		`__name__="cpu_detail_usage",db="system",bk_biz_id="2" or __name__="cpu_detail_usage",db="system",bk_biz_id="3"`,
+	)
+	assert.Contains(t, capturedPromQL, `}[1m]`)
+	assert.NotContains(t, capturedPromQL, "__bk_native_vm_ref_")
+	assert.NotContains(t, capturedPromQL, `{__name__="a"}`)
+}
+
+func TestQueryTsNativeVMInfluxExpandsAllReferencesInBinaryExpr(t *testing.T) {
+	ctx := context.Background()
+	log.InitTestLogger()
+	mock.SetOfflineDataArchiveMetadata(&emptyArchiveMetadata{})
+
+	var capturedPromQL string
+	vmselect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPromQL = r.URL.Query().Get("query")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"status":"success","isPartial":false,"data":{"resultType":"matrix","result":[]}}`)
+	}))
+	t.Cleanup(vmselect.Close)
+	reloadTestNativeVMClusterInfo(t, "cluster-a", vmselect.URL)
+
+	storageID := "native-vm-multi-ref-storage"
+	tsdb.SetStorage(storageID, &tsdb.Storage{
+		Type:    consul.InfluxDBStorageType,
+		Address: "http://influxdb-proxy:8080",
+		Timeout: time.Minute,
+	})
+
+	spaceUid := "native-vm-multi-ref-space"
+	mockNativeVMInfluxTables(ctx, spaceUid, storageID, map[string]nativeVMInfluxTable{
+		"system.container_memory_rss": {
+			field:       "value",
+			db:          "system",
+			measurement: "container_memory_rss",
+		},
+		"system.container_spec_memory_limit_bytes": {
+			field:       "value",
+			db:          "system",
+			measurement: "container_spec_memory_limit_bytes",
+		},
+	})
+
+	_, err := queryTs(ctx, &structured.QueryTs{
+		SpaceUid: spaceUid,
+		QueryList: []*structured.Query{
+			{
+				TableID:       "system.container_memory_rss",
+				FieldName:     "value",
+				ReferenceName: "a",
+				AggregateMethodList: []structured.AggregateMethod{
+					{Method: "max", Dimensions: []string{"bcs_cluster_id", "pod_name"}},
+				},
+			},
+			{
+				TableID:       "system.container_spec_memory_limit_bytes",
+				FieldName:     "value",
+				ReferenceName: "b",
+				AggregateMethodList: []structured.AggregateMethod{
+					{Method: "max", Dimensions: []string{"bcs_cluster_id", "pod_name"}},
+				},
+			},
+		},
+		MetricMerge: "a/b*100",
+		Start:       "1677081600",
+		End:         "1677081660",
+		Step:        "60s",
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, capturedPromQL, `__name__="container_memory_rss_value"`)
+	assert.Contains(t, capturedPromQL, `__name__="container_spec_memory_limit_bytes_value"`)
+	assert.NotContains(t, capturedPromQL, "(b)")
+	assert.NotContains(t, capturedPromQL, `{__name__="b"}`)
+}
+
+func TestQueryTsNativeVMInfluxExpandsAllReferencesInThreeReferenceExpr(t *testing.T) {
+	ctx := context.Background()
+	log.InitTestLogger()
+	mock.SetOfflineDataArchiveMetadata(&emptyArchiveMetadata{})
+
+	var capturedPromQL string
+	vmselect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPromQL = r.URL.Query().Get("query")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"status":"success","isPartial":false,"data":{"resultType":"matrix","result":[]}}`)
+	}))
+	t.Cleanup(vmselect.Close)
+	reloadTestNativeVMClusterInfo(t, "cluster-a", vmselect.URL)
+
+	storageID := "native-vm-three-ref-storage"
+	tsdb.SetStorage(storageID, &tsdb.Storage{
+		Type:    consul.InfluxDBStorageType,
+		Address: "http://influxdb-proxy:8080",
+		Timeout: time.Minute,
+	})
+
+	spaceUid := "native-vm-three-ref-space"
+	mockNativeVMInfluxTables(ctx, spaceUid, storageID, map[string]nativeVMInfluxTable{
+		"system.kube_pod_container_resource_requests_cpu_cores": {
+			field:       "value",
+			db:          "system",
+			measurement: "kube_pod_container_resource_requests_cpu_cores",
+		},
+		"system.kube_node_status_allocatable_cpu_cores": {
+			field:       "value",
+			db:          "system",
+			measurement: "kube_node_status_allocatable_cpu_cores",
+		},
+	})
+
+	_, err := queryTs(ctx, &structured.QueryTs{
+		SpaceUid: spaceUid,
+		QueryList: []*structured.Query{
+			{
+				TableID:       "system.kube_pod_container_resource_requests_cpu_cores",
+				FieldName:     "value",
+				ReferenceName: "a",
+				AggregateMethodList: []structured.AggregateMethod{
+					{Method: "sum", Dimensions: []string{"bcs_cluster_id"}},
+				},
+			},
+			{
+				TableID:       "system.kube_node_status_allocatable_cpu_cores",
+				FieldName:     "value",
+				ReferenceName: "b",
+				AggregateMethodList: []structured.AggregateMethod{
+					{Method: "sum", Dimensions: []string{"bcs_cluster_id"}},
+				},
+			},
+			{
+				TableID:       "system.kube_node_status_allocatable_cpu_cores",
+				FieldName:     "value",
+				ReferenceName: "c",
+				AggregateMethodList: []structured.AggregateMethod{
+					{Method: "count", Dimensions: []string{"bcs_cluster_id"}},
+				},
+			},
+		},
+		MetricMerge: "a/b-(c-1)/c",
+		Start:       "1677081600",
+		End:         "1677081660",
+		Step:        "60s",
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, capturedPromQL, `__name__="kube_pod_container_resource_requests_cpu_cores_value"`)
+	assert.Contains(t, capturedPromQL, `__name__="kube_node_status_allocatable_cpu_cores_value"`)
+	assert.NotContains(t, capturedPromQL, "(b)")
+	assert.NotContains(t, capturedPromQL, "(c)")
+	assert.NotContains(t, capturedPromQL, `{__name__="b"}`)
+	assert.NotContains(t, capturedPromQL, `{__name__="c"}`)
+}
+
+func TestQueryTsNativeVMInfluxKeepsBusinessStatusForMissingReferenceSelector(t *testing.T) {
+	ctx := context.Background()
+	log.InitTestLogger()
+	mock.SetOfflineDataArchiveMetadata(&emptyArchiveMetadata{})
+
+	var capturedPromQL string
+	vmselect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPromQL = r.URL.Query().Get("query")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"status":"success","isPartial":false,"data":{"resultType":"matrix","result":[]}}`)
+	}))
+	t.Cleanup(vmselect.Close)
+	reloadTestNativeVMClusterInfo(t, "cluster-a", vmselect.URL)
+
+	storageID := "native-vm-missing-ref-status-storage"
+	tsdb.SetStorage(storageID, &tsdb.Storage{
+		Type:    consul.InfluxDBStorageType,
+		Address: "http://influxdb-proxy:8080",
+		Timeout: time.Minute,
+	})
+
+	spaceUid := "native-vm-missing-ref-status-space"
+	mockNativeVMInfluxTables(ctx, spaceUid, storageID, map[string]nativeVMInfluxTable{
+		"system.kube_pod_container_resource_requests_cpu_cores": {
+			field:       "value",
+			db:          "system",
+			measurement: "kube_pod_container_resource_requests_cpu_cores",
+		},
+	})
+
+	res, err := queryTs(ctx, &structured.QueryTs{
+		SpaceUid: spaceUid,
+		QueryList: []*structured.Query{
+			{
+				TableID:       "system.kube_pod_container_resource_requests_cpu_cores",
+				FieldName:     "value",
+				ReferenceName: "a",
+				AggregateMethodList: []structured.AggregateMethod{
+					{Method: "sum", Dimensions: []string{"bcs_cluster_id"}},
+				},
+			},
+			{
+				TableID:       "system.kube_node_status_allocatable_cpu_cores",
+				FieldName:     "value",
+				ReferenceName: "b",
+				AggregateMethodList: []structured.AggregateMethod{
+					{Method: "sum", Dimensions: []string{"bcs_cluster_id"}},
+				},
+			},
+			{
+				TableID:       "system.kube_node_status_allocatable_cpu_cores",
+				FieldName:     "value",
+				ReferenceName: "c",
+				AggregateMethodList: []structured.AggregateMethod{
+					{Method: "count", Dimensions: []string{"bcs_cluster_id"}},
+				},
+			},
+		},
+		MetricMerge: "a/b-(c-1)/c",
+		Start:       "1677081600",
+		End:         "1677081660",
+		Step:        "60s",
+	})
+	require.NoError(t, err)
+
+	resp, ok := res.(*PromData)
+	require.True(t, ok)
+	require.NotNil(t, resp.Status)
+	assert.Equal(t, metadata.SpaceTableIDFieldIsNotExists, resp.Status.Code)
+	assert.Contains(t, resp.Status.Message, "kube_node_status_allocatable_cpu_cores")
+	assert.Contains(t, capturedPromQL, `__name__="kube_pod_container_resource_requests_cpu_cores_value"`)
+	assert.Contains(t, capturedPromQL, structured.NativeVMMissingReferenceSelector("b"))
+	assert.Contains(t, capturedPromQL, structured.NativeVMMissingReferenceSelector("c"))
+	assert.NotContains(t, capturedPromQL, `{__name__="b"}`)
+	assert.NotContains(t, capturedPromQL, `{__name__="c"}`)
+}
+
+func TestQueryTsNativeVMInfluxExpandsReferenceInNestedAggregateExpr(t *testing.T) {
+	ctx := context.Background()
+	log.InitTestLogger()
+	mock.SetOfflineDataArchiveMetadata(&emptyArchiveMetadata{})
+
+	var capturedPromQL string
+	vmselect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPromQL = r.URL.Query().Get("query")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"status":"success","isPartial":false,"data":{"resultType":"matrix","result":[]}}`)
+	}))
+	t.Cleanup(vmselect.Close)
+	reloadTestNativeVMClusterInfo(t, "cluster-a", vmselect.URL)
+
+	storageID := "native-vm-nested-ref-storage"
+	tsdb.SetStorage(storageID, &tsdb.Storage{
+		Type:    consul.InfluxDBStorageType,
+		Address: "http://influxdb-proxy:8080",
+		Timeout: time.Minute,
+	})
+
+	spaceUid := "native-vm-nested-ref-space"
+	mockNativeVMInfluxTables(ctx, spaceUid, storageID, map[string]nativeVMInfluxTable{
+		"system.kube_pod_status_phase": {
+			field:       "value",
+			db:          "system",
+			measurement: "kube_pod_status_phase",
+		},
+		"system.kube_pod_owner": {
+			field:       "value",
+			db:          "system",
+			measurement: "kube_pod_owner",
+		},
+	})
+
+	_, err := queryTs(ctx, &structured.QueryTs{
+		SpaceUid: spaceUid,
+		QueryList: []*structured.Query{
+			{
+				TableID:       "system.kube_pod_status_phase",
+				FieldName:     "value",
+				ReferenceName: "a",
+				AggregateMethodList: []structured.AggregateMethod{
+					{Method: "max", Dimensions: []string{"bcs_cluster_id", "namespace", "pod"}},
+				},
+			},
+			{
+				TableID:       "system.kube_pod_owner",
+				FieldName:     "value",
+				ReferenceName: "b",
+				AggregateMethodList: []structured.AggregateMethod{
+					{Method: "max", Dimensions: []string{"bcs_cluster_id", "namespace", "pod"}},
+					{Method: "topk", VArgsList: []interface{}{1}, Position: 1},
+				},
+			},
+		},
+		MetricMerge: "a * b",
+		Start:       "1677081600",
+		End:         "1677081660",
+		Step:        "60s",
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, capturedPromQL, `__name__="kube_pod_status_phase_value"`)
+	assert.Contains(t, capturedPromQL, `__name__="kube_pod_owner_value"`)
+	assert.Contains(t, capturedPromQL, "topk")
+	assert.NotContains(t, capturedPromQL, "(b)")
+	assert.NotContains(t, capturedPromQL, `{__name__="b"}`)
+}
+
 func reloadTestNativeVMClusterInfo(t *testing.T, clusterName, selectAddress string) {
 	t.Helper()
 
-	oldGetDataWithPrefix := consul.GetDataWithPrefix
+	oldHGetAll := redis.HGetAll
 	defer func() {
-		consul.GetDataWithPrefix = oldGetDataWithPrefix
+		redis.HGetAll = oldHGetAll
 	}()
-	consul.GetDataWithPrefix = func(prefix string) (api.KVPairs, error) {
-		return api.KVPairs{
-			{
-				Key: "bkmonitorv3/unify-query/data/vmcluster_info/" + clusterName,
-				Value: []byte(`{
-					"cluster_name": "` + clusterName + `",
-					"readable": true,
-					"select": {
-						"address": "` + selectAddress + `",
-						"api_prefix": "/select/0/prometheus/api/v1",
-						"basic_auth": {"username": "query", "password": "secret"}
-					},
-					"influx_compat": {
-						"db_label": "db",
-						"measurement_field_separator": "_",
-						"skip_single_field": false
-					}
-				}`),
-			},
+	redis.HGetAll = func(ctx context.Context, key string) (map[string]string, error) {
+		return map[string]string{
+			clusterName: `{
+				"cluster_name": "` + clusterName + `",
+				"readable": true,
+				"select": {
+					"address": "` + selectAddress + `",
+					"api_prefix": "/select/0/prometheus/api/v1",
+					"basic_auth": {"username": "query", "password": "secret"}
+				},
+				"influx_compat": {
+					"db_label": "db",
+					"measurement_field_separator": "_",
+					"skip_single_field": false
+				}
+			}`,
 		}, nil
 	}
 	require.NoError(t, consul.ReloadVMClusterInfo())
 	t.Cleanup(func() {
-		cleanupGetDataWithPrefix := consul.GetDataWithPrefix
+		cleanupHGetAll := redis.HGetAll
 		defer func() {
-			consul.GetDataWithPrefix = cleanupGetDataWithPrefix
+			redis.HGetAll = cleanupHGetAll
 		}()
-		consul.GetDataWithPrefix = func(prefix string) (api.KVPairs, error) {
-			return api.KVPairs{}, nil
+		redis.HGetAll = func(ctx context.Context, key string) (map[string]string, error) {
+			return map[string]string{}, nil
 		}
 		require.NoError(t, consul.ReloadVMClusterInfo())
 	})
+}
+
+type nativeVMInfluxTable struct {
+	field       string
+	db          string
+	measurement string
+}
+
+func mockNativeVMInfluxTables(ctx context.Context, spaceUid, storageID string, tables map[string]nativeVMInfluxTable) {
+	for tableID, table := range tables {
+		mock.SetSpaceAndProxyMockData(
+			ctx,
+			"native_vm_multi_ref_test",
+			"native_vm_multi_ref_test",
+			spaceUid,
+			&redis.TsDB{
+				TableID:         tableID,
+				Field:           []string{table.field},
+				MeasurementType: redis.BKTraditionalMeasurement,
+			},
+			&ir.Proxy{
+				MeasurementType: redis.BKTraditionalMeasurement,
+				StorageID:       storageID,
+				ClusterName:     "cluster-a",
+				Db:              table.db,
+				Measurement:     table.measurement,
+			},
+		)
+	}
+
+	proxyInfo := ir.ProxyInfo{}
+	for tableID, table := range tables {
+		proxyInfo[tableID] = &ir.Proxy{
+			MeasurementType: redis.BKTraditionalMeasurement,
+			StorageID:       storageID,
+			ClusterName:     "cluster-a",
+			Db:              table.db,
+			Measurement:     table.measurement,
+		}
+	}
+	uqInfluxdb.MockRouter(proxyInfo, ir.QueryRouterInfo{})
 }

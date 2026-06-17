@@ -14,12 +14,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/consul/api"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/mock"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/redis"
@@ -118,42 +118,254 @@ func TestNativeVMInfluxQueryMetadata(t *testing.T) {
 	assertNativeMatcher(t, qry.NativeVMMatchers, "bk_biz_id", labels.MatchEqual, "2")
 }
 
+func TestNativeVMInfluxQueryMetadataKeepsOrMatcherGroups(t *testing.T) {
+	ctx := context.Background()
+	storageID := "native-vm-influx-query-or-metadata"
+	spaceUid := "native-vm-or-space"
+	tableID := "system.cpu_detail"
+	mock.SetOfflineDataArchiveMetadata(&m{})
+	reloadTestVMClusterInfo(t, "cluster-a")
+
+	tsdb.SetStorage(storageID, &tsdb.Storage{
+		Type:    consul.InfluxDBStorageType,
+		Address: "http://influxdb-proxy:8080",
+		Timeout: time.Minute,
+	})
+	mock.SetSpaceAndProxyMockData(
+		ctx,
+		"native_vm_influx_query_or_metadata",
+		"native_vm_influx_query_or_metadata",
+		spaceUid,
+		&redis.TsDB{
+			TableID:         tableID,
+			Field:           []string{"usage"},
+			MeasurementType: redis.BKTraditionalMeasurement,
+		},
+		&ir.Proxy{
+			MeasurementType: redis.BKTraditionalMeasurement,
+			StorageID:       storageID,
+			ClusterName:     "cluster-a",
+			Db:              "system",
+			Measurement:     "cpu_detail",
+		},
+	)
+
+	query := &Query{
+		TableID:       TableID(tableID),
+		FieldName:     "usage",
+		ReferenceName: "a",
+		Start:         "0",
+		End:           "60",
+		Step:          "60s",
+		Conditions: Conditions{
+			FieldList: []ConditionField{
+				{
+					DimensionName: "bk_biz_id",
+					Operator:      ConditionEqual,
+					Value:         []string{"2"},
+				},
+				{
+					DimensionName: "bk_biz_id",
+					Operator:      ConditionEqual,
+					Value:         []string{"3"},
+				},
+			},
+			ConditionList: []string{ConditionOr},
+		},
+	}
+
+	queryMetric, err := query.ToQueryMetric(ctx, spaceUid)
+	require.NoError(t, err)
+	require.Len(t, queryMetric.QueryList, 1)
+
+	qry := queryMetric.QueryList[0]
+	require.True(t, qry.NativeVMInflux)
+	require.Len(t, qry.NativeVMMatcherGroups, 2)
+	assertNativeMatcher(t, qry.NativeVMMatcherGroups[0], "bk_biz_id", labels.MatchEqual, "2")
+	assertNativeMatcher(t, qry.NativeVMMatcherGroups[1], "bk_biz_id", labels.MatchEqual, "3")
+	assert.False(t, qry.NativeVMUnsupportedOr)
+}
+
+func TestNativeVMInfluxQueryMetadataCombinesQueryAndFilterOrGroups(t *testing.T) {
+	ctx := context.Background()
+	storageID := "native-vm-influx-query-filter-or"
+	spaceUid := "native-vm-filter-or-space"
+	tableID := "system.cpu_detail"
+	mock.SetOfflineDataArchiveMetadata(&m{})
+	reloadTestVMClusterInfo(t, "cluster-a")
+
+	tsdb.SetStorage(storageID, &tsdb.Storage{
+		Type:    consul.InfluxDBStorageType,
+		Address: "http://influxdb-proxy:8080",
+		Timeout: time.Minute,
+	})
+	mock.SetSpaceAndProxyMockData(
+		ctx,
+		"native_vm_influx_query_filter_or",
+		"native_vm_influx_query_filter_or",
+		spaceUid,
+		&redis.TsDB{
+			TableID:         tableID,
+			Field:           []string{"usage"},
+			MeasurementType: redis.BKTraditionalMeasurement,
+			Filters: []redis.Filter{
+				{"bcs_cluster_id": "cluster-a"},
+				{"bcs_cluster_id": "cluster-b"},
+			},
+		},
+		&ir.Proxy{
+			MeasurementType: redis.BKTraditionalMeasurement,
+			StorageID:       storageID,
+			ClusterName:     "cluster-a",
+			Db:              "system",
+			Measurement:     "cpu_detail",
+		},
+	)
+
+	query := &Query{
+		TableID:       TableID(tableID),
+		FieldName:     "usage",
+		ReferenceName: "a",
+		Start:         "0",
+		End:           "60",
+		Step:          "60s",
+		Conditions: Conditions{
+			FieldList: []ConditionField{
+				{
+					DimensionName: "bk_biz_id",
+					Operator:      ConditionEqual,
+					Value:         []string{"2"},
+				},
+				{
+					DimensionName: "bk_biz_id",
+					Operator:      ConditionEqual,
+					Value:         []string{"3"},
+				},
+			},
+			ConditionList: []string{ConditionOr},
+		},
+	}
+
+	queryMetric, err := query.ToQueryMetric(ctx, spaceUid)
+	require.NoError(t, err)
+	require.Len(t, queryMetric.QueryList, 1)
+
+	qry := queryMetric.QueryList[0]
+	require.True(t, qry.NativeVMInflux)
+	require.Len(t, qry.NativeVMMatcherGroups, 4)
+	assertNativeMatcher(t, qry.NativeVMMatcherGroups[0], "bk_biz_id", labels.MatchEqual, "2")
+	assertNativeMatcher(t, qry.NativeVMMatcherGroups[0], "bcs_cluster_id", labels.MatchEqual, "cluster-a")
+	assertNativeMatcher(t, qry.NativeVMMatcherGroups[1], "bk_biz_id", labels.MatchEqual, "2")
+	assertNativeMatcher(t, qry.NativeVMMatcherGroups[1], "bcs_cluster_id", labels.MatchEqual, "cluster-b")
+	assertNativeMatcher(t, qry.NativeVMMatcherGroups[2], "bk_biz_id", labels.MatchEqual, "3")
+	assertNativeMatcher(t, qry.NativeVMMatcherGroups[2], "bcs_cluster_id", labels.MatchEqual, "cluster-a")
+	assertNativeMatcher(t, qry.NativeVMMatcherGroups[3], "bk_biz_id", labels.MatchEqual, "3")
+	assertNativeMatcher(t, qry.NativeVMMatcherGroups[3], "bcs_cluster_id", labels.MatchEqual, "cluster-b")
+}
+
+func TestQueryTsToNativeVMMetricQLIgnoresUnusedReferenceWithoutSelector(t *testing.T) {
+	ctx := context.Background()
+	log.InitTestLogger()
+	query := &QueryTs{
+		QueryList: []*Query{
+			{ReferenceName: "a"},
+			{ReferenceName: "b"},
+		},
+		MetricMerge: "a",
+	}
+
+	metricQL, err := query.ToNativeVMMetricQL(ctx, &metadata.NativeVMInfluxExpand{
+		MetricSelector: map[string]string{
+			"a": `{__name__="cpu_detail_usage",db="system"}`,
+		},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, `{__name__="cpu_detail_usage",db="system"}`, metricQL)
+	assert.NotContains(t, metricQL, `{__name__="b"}`)
+	assert.NotContains(t, metricQL, NativeVMMissingReferenceSelector("b"))
+}
+
+func TestQueryTsToPromExprNativeVMInfluxExpandsNestedReferences(t *testing.T) {
+	ctx := context.Background()
+	log.InitTestLogger()
+	nameMatcher := func(metric string) []*labels.Matcher {
+		matcher, err := labels.NewMatcher(labels.MatchEqual, labels.MetricName, metric)
+		require.NoError(t, err)
+		return []*labels.Matcher{matcher}
+	}
+
+	query := &QueryTs{
+		QueryList: []*Query{
+			{
+				FieldName:     "value",
+				ReferenceName: "a",
+				AggregateMethodList: []AggregateMethod{
+					{Method: "max", Dimensions: []string{"pod"}},
+				},
+			},
+			{
+				FieldName:     "value",
+				ReferenceName: "b",
+				AggregateMethodList: []AggregateMethod{
+					{Method: "max", Dimensions: []string{"pod"}},
+					{Method: "topk", VArgsList: []interface{}{1}, Position: 1},
+				},
+			},
+		},
+		MetricMerge: "a * b",
+	}
+
+	expr, err := query.ToPromExpr(
+		ctx,
+		map[string]string{"a": "", "b": ""},
+		map[string][]*labels.Matcher{
+			"a": nameMatcher("kube_pod_status_phase_value"),
+			"b": nameMatcher("kube_pod_owner_value"),
+		},
+	)
+	require.NoError(t, err)
+
+	promQL := expr.String()
+	assert.Contains(t, promQL, `__name__="kube_pod_status_phase_value"`)
+	assert.Contains(t, promQL, `__name__="kube_pod_owner_value"`)
+	assert.NotContains(t, promQL, "(b)")
+	assert.NotContains(t, promQL, `{__name__="b"}`)
+}
+
 func reloadTestVMClusterInfo(t *testing.T, clusterName string) {
 	t.Helper()
 
-	oldGetDataWithPrefix := consul.GetDataWithPrefix
+	oldHGetAll := redis.HGetAll
 	defer func() {
-		consul.GetDataWithPrefix = oldGetDataWithPrefix
+		redis.HGetAll = oldHGetAll
 	}()
-	consul.GetDataWithPrefix = func(prefix string) (api.KVPairs, error) {
-		return api.KVPairs{
-			{
-				Key: "bkmonitorv3/unify-query/data/vmcluster_info/" + clusterName,
-				Value: []byte(`{
-					"cluster_name": "` + clusterName + `",
-					"readable": true,
-					"select": {
-						"address": "http://vmselect:8481",
-						"api_prefix": "/select/0/prometheus/api/v1",
-						"basic_auth": {"username": "query", "password": "secret"}
-					},
-					"influx_compat": {
-						"db_label": "db",
-						"measurement_field_separator": "_",
-						"skip_single_field": false
-					}
-				}`),
-			},
+	redis.HGetAll = func(ctx context.Context, key string) (map[string]string, error) {
+		return map[string]string{
+			clusterName: `{
+				"cluster_name": "` + clusterName + `",
+				"readable": true,
+				"select": {
+					"address": "http://vmselect:8481",
+					"api_prefix": "/select/0/prometheus/api/v1",
+					"basic_auth": {"username": "query", "password": "secret"}
+				},
+				"influx_compat": {
+					"db_label": "db",
+					"measurement_field_separator": "_",
+					"skip_single_field": false
+				}
+			}`,
 		}, nil
 	}
 	require.NoError(t, consul.ReloadVMClusterInfo())
 	t.Cleanup(func() {
-		cleanupGetDataWithPrefix := consul.GetDataWithPrefix
+		cleanupHGetAll := redis.HGetAll
 		defer func() {
-			consul.GetDataWithPrefix = cleanupGetDataWithPrefix
+			redis.HGetAll = cleanupHGetAll
 		}()
-		consul.GetDataWithPrefix = func(prefix string) (api.KVPairs, error) {
-			return api.KVPairs{}, nil
+		redis.HGetAll = func(ctx context.Context, key string) (map[string]string, error) {
+			return map[string]string{}, nil
 		}
 		require.NoError(t, consul.ReloadVMClusterInfo())
 	})

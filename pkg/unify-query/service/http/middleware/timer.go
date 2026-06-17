@@ -10,8 +10,11 @@
 package middleware
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"sync"
 	"time"
 
@@ -31,8 +34,9 @@ type Params struct {
 }
 
 var (
-	once        sync.Once
-	instancedIP string
+	once              sync.Once
+	instancedIP       string
+	getInstanceipFunc = getInstanceip
 )
 
 // get instance ip
@@ -52,7 +56,7 @@ func getInstanceip() (string, error) {
 // get instance ip single pass
 func singleGetInstance() string {
 	once.Do(func() {
-		instancedIP, _ = getInstanceip()
+		instancedIP, _ = getInstanceipFunc()
 	})
 	return instancedIP
 }
@@ -61,14 +65,21 @@ func singleGetInstance() string {
 func Timer(p *Params) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var (
-			ctx        = c.Request.Context()
-			span       oleltrace.Span
-			start      = time.Now()
-			instanceIP = singleGetInstance()
-			source     = c.Request.Header.Get(metadata.BkQuerySourceHeader)
-			spaceUid   = c.Request.Header.Get(metadata.SpaceUIDHeader)
+			ctx         = c.Request.Context()
+			span        oleltrace.Span
+			start       = time.Now()
+			instanceIP  = singleGetInstance()
+			source      = c.Request.Header.Get(metadata.BkQuerySourceHeader)
+			spaceUid    = c.Request.Header.Get(metadata.SpaceUIDHeader)
+			requestBody []byte
 		)
 		ctx, span = trace.IntoContext(ctx, trace.TracerName, "http-api")
+
+		var err error
+		requestBody, err = readAndRestoreRequestBody(c.Request)
+		if err != nil {
+			log.Errorf(ctx, "read http request body for access log failed: %s", err)
+		}
 
 		// 把用户名注入到 metadata 中
 		metadata.SetUser(ctx, source, spaceUid)
@@ -94,10 +105,29 @@ func Timer(p *Params) gin.HandlerFunc {
 				trace.InsertIntIntoSpan("http-api-query-cost", int(sub.Milliseconds()), span)
 
 				status := metadata.GetStatus(ctx)
+				var statusCode, statusMessage string
 				if status != nil {
+					statusCode = status.Code
+					statusMessage = status.Message
 					trace.InsertStringIntoSpan("http-api-status-code", status.Code, span)
 					trace.InsertStringIntoSpan("http-api-status-message", status.Message, span)
 				}
+
+				log.Infof(
+					ctx,
+					"http request completed method=%s path=%s status=%d duration=%s space_uid=%s source=%s client_ip=%s body_size=%d body=%q status_code=%s status_message=%s",
+					c.Request.Method,
+					c.Request.URL.Path,
+					c.Writer.Status(),
+					sub.String(),
+					spaceUid,
+					source,
+					c.ClientIP(),
+					len(requestBody),
+					string(requestBody),
+					statusCode,
+					statusMessage,
+				)
 
 				span.End()
 			}()
@@ -105,4 +135,14 @@ func Timer(p *Params) gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+func readAndRestoreRequestBody(req *http.Request) ([]byte, error) {
+	if req == nil || req.Body == nil {
+		return nil, nil
+	}
+
+	body, err := io.ReadAll(req.Body)
+	req.Body = io.NopCloser(bytes.NewBuffer(body))
+	return body, err
 }

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 
+	uqRedis "github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/redis"
 	"github.com/hashicorp/consul/api"
 )
 
@@ -25,6 +26,8 @@ var (
 	vmClusterInfoHash string
 	vmClusterInfoLock = new(sync.RWMutex)
 )
+
+const vmClusterInfoRedisPrefix = "bkmonitorv3:influxdb"
 
 // VMBasicAuth is the optional basic auth used by a VM endpoint.
 type VMBasicAuth struct {
@@ -65,6 +68,14 @@ func watchVMClusterInfoPath() string {
 	return fmt.Sprintf("%s/%s/%s", basePath, versionPath, vmClusterInfoPath)
 }
 
+func formatVMClusterInfoRedisKey() string {
+	return fmt.Sprintf("%s:%s", vmClusterInfoRedisPrefix, vmClusterInfoPath)
+}
+
+func watchVMClusterInfoRedisChannel() string {
+	return vmClusterInfoRedisPrefix
+}
+
 // FormatVMClusterInfo formats raw Consul KVs into a cluster_name keyed map.
 func FormatVMClusterInfo(kvPairs api.KVPairs) (map[string]*VMClusterInfo, error) {
 	result := make(map[string]*VMClusterInfo)
@@ -83,13 +94,29 @@ func FormatVMClusterInfo(kvPairs api.KVPairs) (map[string]*VMClusterInfo, error)
 	return result, nil
 }
 
-// GetVMClusterInfo gets all VM cluster metadata from Consul.
+// FormatVMClusterInfoFromRedis formats Redis hash values into a cluster_name keyed map.
+func FormatVMClusterInfoFromRedis(values map[string]string) (map[string]*VMClusterInfo, error) {
+	result := make(map[string]*VMClusterInfo, len(values))
+	for clusterName, value := range values {
+		var data VMClusterInfo
+		if err := json.Unmarshal([]byte(value), &data); err != nil {
+			return nil, err
+		}
+		if data.ClusterName == "" {
+			data.ClusterName = clusterName
+		}
+		result[clusterName] = &data
+	}
+	return result, nil
+}
+
+// GetVMClusterInfo gets all VM cluster metadata from Redis.
 func GetVMClusterInfo() (map[string]*VMClusterInfo, error) {
-	pairs, err := GetDataWithPrefix(formatVMClusterInfoPath())
+	values, err := uqRedis.HGetAll(context.Background(), formatVMClusterInfoRedisKey())
 	if err != nil {
 		return nil, err
 	}
-	return FormatVMClusterInfo(pairs)
+	return FormatVMClusterInfoFromRedis(values)
 }
 
 // ReloadVMClusterInfo reloads VM cluster metadata into the local cache.
@@ -111,9 +138,32 @@ func ReloadVMClusterInfo() error {
 	return nil
 }
 
-// WatchVMClusterInfo watches VM cluster metadata version changes.
+// WatchVMClusterInfo watches Redis publish notifications for VM cluster metadata changes.
 func WatchVMClusterInfo(ctx context.Context) (<-chan interface{}, error) {
-	return WatchChange(ctx, watchVMClusterInfoPath())
+	source := uqRedis.Subscribe(ctx, watchVMClusterInfoRedisChannel())
+	ch := make(chan interface{})
+	go func() {
+		defer close(ch)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg, ok := <-source:
+				if !ok {
+					return
+				}
+				if msg == nil || msg.Payload != vmClusterInfoPath {
+					continue
+				}
+				select {
+				case ch <- msg.Payload:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return ch, nil
 }
 
 // GetCachedVMClusterInfo returns one cached VM cluster metadata item.

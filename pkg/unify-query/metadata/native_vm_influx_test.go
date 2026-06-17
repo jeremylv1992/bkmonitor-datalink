@@ -57,6 +57,65 @@ func TestCheckNativeVMInfluxQuery(t *testing.T) {
 	assertNativeVMMatcher(t, expand.LabelsMatcher["a"], labels.MetricName, labels.MatchEqual, "cpu_detail_usage")
 	assertNativeVMMatcher(t, expand.LabelsMatcher["a"], "db", labels.MatchEqual, "system")
 	assertNativeVMMatcher(t, expand.LabelsMatcher["a"], "bk_biz_id", labels.MatchEqual, "2")
+	assert.Equal(t, `{__name__="cpu_detail_usage",db="system",bk_biz_id="2"}`, expand.MetricSelector["a"])
+}
+
+func TestNativeVMInfluxSelectorBuildsMetricQLOrGroups(t *testing.T) {
+	biz2, err := labels.NewMatcher(labels.MatchEqual, "bk_biz_id", "2")
+	require.NoError(t, err)
+	biz3, err := labels.NewMatcher(labels.MatchEqual, "bk_biz_id", "3")
+	require.NoError(t, err)
+	pod, err := labels.NewMatcher(labels.MatchRegexp, "pod_name", `api-\d+`)
+	require.NoError(t, err)
+
+	selector, err := NativeVMInfluxSelector(&Query{
+		DB:                                "system",
+		Measurement:                       "cpu_detail",
+		Field:                             "usage",
+		NativeVMDBLabel:                   "db",
+		NativeVMMeasurementFieldSeparator: "_",
+		NativeVMMatcherGroups: [][]*labels.Matcher{
+			{biz2, pod},
+			{biz3},
+		},
+	})
+	require.NoError(t, err)
+
+	assert.Equal(
+		t,
+		`{__name__="cpu_detail_usage",db="system",bk_biz_id="2",pod_name=~"api-\\d+" or __name__="cpu_detail_usage",db="system",bk_biz_id="3"}`,
+		selector,
+	)
+}
+
+func TestNativeVMInfluxSelectorEscapesLabelValues(t *testing.T) {
+	matcher, err := labels.NewMatcher(labels.MatchEqual, "pod", "api\"\\n")
+	require.NoError(t, err)
+
+	selector, err := NativeVMInfluxSelector(&Query{
+		DB:                    "system",
+		Measurement:           "cpu_detail",
+		Field:                 "usage",
+		NativeVMMatcherGroups: [][]*labels.Matcher{{matcher}},
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, `{__name__="cpu_detail_usage",db="system",pod="api\"\\n"}`, selector)
+}
+
+func TestNativeVMInfluxSelectorRejectsReservedLabelConflict(t *testing.T) {
+	matcher, err := labels.NewMatcher(labels.MatchEqual, "db", "other")
+	require.NoError(t, err)
+
+	_, err = NativeVMInfluxSelector(&Query{
+		DB:                    "system",
+		Measurement:           "cpu_detail",
+		Field:                 "usage",
+		NativeVMDBLabel:       "db",
+		NativeVMMatcherGroups: [][]*labels.Matcher{{matcher}},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reserved label")
 }
 
 func TestCheckNativeVMInfluxQueryRejectsMixedStorage(t *testing.T) {
@@ -168,26 +227,41 @@ func TestCheckNativeVMInfluxQueryRejectsDifferentBackend(t *testing.T) {
 	assert.Contains(t, err.Error(), "multiple backends")
 }
 
-func TestCheckNativeVMInfluxQueryRejectsUnsupportedOr(t *testing.T) {
+func TestCheckNativeVMInfluxQueryAllowsMetricQLOr(t *testing.T) {
+	biz2, err := labels.NewMatcher(labels.MatchEqual, "bk_biz_id", "2")
+	require.NoError(t, err)
+	biz3, err := labels.NewMatcher(labels.MatchEqual, "bk_biz_id", "3")
+	require.NoError(t, err)
+
 	queryRef := QueryReference{
 		"a": &QueryMetric{
 			QueryList: QueryList{
 				&Query{
-					NativeVMInflux:        true,
-					NativeVMUnsupportedOr: true,
-					StorageID:             "native-vm-storage",
-					DB:                    "system",
-					Measurement:           "cpu_detail",
-					Field:                 "usage",
+					NativeVMInflux:    true,
+					StorageID:         "native-vm-storage",
+					DB:                "system",
+					Measurement:       "cpu_detail",
+					Field:             "usage",
+					NativeVMAddress:   "http://vmselect:8481",
+					NativeVMAPIPrefix: "/select/0/prometheus/api/v1",
+					NativeVMMatcherGroups: [][]*labels.Matcher{
+						{biz2},
+						{biz3},
+					},
 				},
 			},
 		},
 	}
 
-	ok, _, err := queryRef.CheckNativeVMInfluxQuery(context.Background())
-	assert.False(t, ok)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "or condition")
+	ok, expand, err := queryRef.CheckNativeVMInfluxQuery(context.Background())
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(
+		t,
+		`{__name__="cpu_detail_usage",db="system",bk_biz_id="2" or __name__="cpu_detail_usage",db="system",bk_biz_id="3"}`,
+		expand.MetricSelector["a"],
+	)
+	assert.Empty(t, expand.LabelsMatcher["a"])
 }
 
 func assertNativeVMMatcher(t *testing.T, matchers []*labels.Matcher, name string, matchType labels.MatchType, value string) {
