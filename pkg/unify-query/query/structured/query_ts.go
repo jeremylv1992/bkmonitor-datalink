@@ -550,12 +550,12 @@ func (q *Query) ToQueryMetric(ctx context.Context, spaceUid string) (*metadata.Q
 				}
 				if len(filterConditions) == 1 {
 					for _, cond := range filterConditions[0] {
-						if len(cond.Value) == 0 {
-							continue
-						}
-						matcher, err := labels.NewMatcher(labels.MatchEqual, cond.DimensionName, cond.Value[0])
+						matcher, err := conditionToNativeVMMatcher(cond)
 						if err != nil {
 							return nil, err
+						}
+						if matcher == nil {
+							continue
 						}
 						query.NativeVMMatchers = append(query.NativeVMMatchers, matcher)
 					}

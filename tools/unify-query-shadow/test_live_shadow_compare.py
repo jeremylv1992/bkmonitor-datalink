@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# Tencent is pleased to support the open source community by making
+# 蓝鲸智云 - 监控平台 (BlueKing - Monitor) available.
+# Copyright (C) 2022 THL A29 Limited, a Tencent company. All rights reserved.
+# Licensed under the MIT License (the "License"); you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at http://opensource.org/licenses/MIT
+# Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+# an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations under the License.
+
 from __future__ import print_function
 
 import importlib.util
@@ -217,7 +226,7 @@ class LiveShadowCompareTest(unittest.TestCase):
         self.assertNotEqual(first["X-Bkapi-Trace-Id"], "original-bkapi-trace")
         self.assertRegex(first["Traceparent"], r"^00-[0-9a-f]{32}-[0-9a-f]{16}-01$")
 
-    def test_classify_series_presentation_only_mismatch(self):
+    def test_classify_series_presentation_only_difference_as_semantic_equal(self):
         new = self.sample_response(body=json.dumps({
             "series": [
                 {
@@ -239,8 +248,8 @@ class LiveShadowCompareTest(unittest.TestCase):
 
         case = self.mod.classify(new, old)
 
-        self.assertFalse(case.equal)
-        self.assertEqual(case.attribution, "series_presentation_mismatch")
+        self.assertTrue(case.equal)
+        self.assertEqual(case.attribution, "series_presentation_equal")
         self.assertEqual(case.diff_path, "body.series")
 
     def test_classify_status_code_mismatch(self):

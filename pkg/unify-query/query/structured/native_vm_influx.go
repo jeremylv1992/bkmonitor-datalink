@@ -12,6 +12,7 @@ package structured
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -43,6 +44,54 @@ func NativeVMInfluxLabelMatchers(query *metadata.Query) ([]*labels.Matcher, erro
 	return metadata.NativeVMInfluxLabelMatchers(query)
 }
 
+func nativeVMRegexUnion(values []string, quote bool, substring bool) string {
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		if quote {
+			value = regexp.QuoteMeta(value)
+		}
+		parts = append(parts, value)
+	}
+
+	union := "(?:" + strings.Join(parts, "|") + ")"
+	if substring {
+		return ".*" + union + ".*"
+	}
+	return union
+}
+
+func conditionToNativeVMMatcher(cond ConditionField) (*labels.Matcher, error) {
+	if len(cond.Value) == 0 {
+		return nil, nil
+	}
+
+	switch cond.Operator {
+	case ConditionEqual:
+		if len(cond.Value) == 1 {
+			return labels.NewMatcher(labels.MatchEqual, cond.DimensionName, cond.Value[0])
+		}
+		return labels.NewMatcher(labels.MatchRegexp, cond.DimensionName, nativeVMRegexUnion(cond.Value, true, false))
+	case ConditionNotEqual:
+		if len(cond.Value) == 1 {
+			return labels.NewMatcher(labels.MatchNotEqual, cond.DimensionName, cond.Value[0])
+		}
+		return labels.NewMatcher(labels.MatchNotRegexp, cond.DimensionName, nativeVMRegexUnion(cond.Value, true, false))
+	case ConditionContains:
+		return labels.NewMatcher(labels.MatchRegexp, cond.DimensionName, nativeVMRegexUnion(cond.Value, true, true))
+	case ConditionNotContains:
+		if len(cond.Value) == 1 && cond.Value[0] == "" {
+			return labels.NewMatcher(labels.MatchNotEqual, cond.DimensionName, "")
+		}
+		return labels.NewMatcher(labels.MatchNotRegexp, cond.DimensionName, nativeVMRegexUnion(cond.Value, true, true))
+	case ConditionRegEqual:
+		return labels.NewMatcher(labels.MatchRegexp, cond.DimensionName, nativeVMRegexUnion(cond.Value, false, true))
+	case ConditionNotRegEqual:
+		return labels.NewMatcher(labels.MatchNotRegexp, cond.DimensionName, nativeVMRegexUnion(cond.Value, false, true))
+	default:
+		return labels.NewMatcher(cond.ToPromOperator(), cond.DimensionName, cond.Value[0])
+	}
+}
+
 func conditionGroupsToNativeVMMatchers(groups [][]ConditionField) ([][]*labels.Matcher, error) {
 	if len(groups) == 0 {
 		return nil, nil
@@ -52,14 +101,12 @@ func conditionGroupsToNativeVMMatchers(groups [][]ConditionField) ([][]*labels.M
 	for _, group := range groups {
 		matchers := make([]*labels.Matcher, 0, len(group))
 		for _, field := range group {
-			cond := field
-			cond = *cond.ContainsToPromReg()
-			if len(cond.Value) == 0 {
-				continue
-			}
-			matcher, err := labels.NewMatcher(cond.ToPromOperator(), cond.DimensionName, cond.Value[0])
+			matcher, err := conditionToNativeVMMatcher(field)
 			if err != nil {
 				return nil, err
+			}
+			if matcher == nil {
+				continue
 			}
 			matchers = append(matchers, matcher)
 		}

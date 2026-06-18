@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# Tencent is pleased to support the open source community by making
+# 蓝鲸智云 - 监控平台 (BlueKing - Monitor) available.
+# Copyright (C) 2022 THL A29 Limited, a Tencent company. All rights reserved.
+# Licensed under the MIT License (the "License"); you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at http://opensource.org/licenses/MIT
+# Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+# an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations under the License.
+
 """Live shadow compare for UnifyQuery requests captured by GoReplay."""
 
 from __future__ import print_function
@@ -525,8 +534,8 @@ def series_presentation_diff(new_json, old_json):
     if first_json_diff(strip_series_lists(new_json), strip_series_lists(old_json), "body") is not None:
         return None
     return CompareResult(
-        False,
-        "series_presentation_mismatch",
+        True,
+        "series_presentation_equal",
         "body.series",
         "series are semantically equal after normalizing series/group_keys order and float precision",
     )
@@ -673,6 +682,7 @@ class Reporter(object):
             "dropped_queue_full": 0,
         }
         self.attribution_counts = {}
+        self.semantic_equal_counts = {}
         self.new_latencies = []
         self.old_latencies = []
         self.recent_mismatches = []
@@ -704,6 +714,8 @@ class Reporter(object):
 
             if cmp_result.equal:
                 self.stats["matched"] += 1
+                if cmp_result.attribution:
+                    self.semantic_equal_counts[cmp_result.attribution] = self.semantic_equal_counts.get(cmp_result.attribution, 0) + 1
                 return
 
             self.stats["mismatched"] += 1
@@ -786,6 +798,7 @@ class Reporter(object):
             "updated_at": now_iso(),
             **self.stats,
             "attribution_counts": dict(sorted(self.attribution_counts.items(), key=lambda item: (-item[1], item[0]))),
+            "semantic_equal_counts": dict(sorted(self.semantic_equal_counts.items(), key=lambda item: (-item[1], item[0]))),
             "latency_ms": {
                 "new_p50": percentile(self.new_latencies, 0.50),
                 "new_p95": percentile(self.new_latencies, 0.95),
@@ -883,6 +896,13 @@ def render_markdown_summary(summary):
         lines.append("No mismatches yet.")
     else:
         for key, count in summary["attribution_counts"].items():
+            lines.append("- `%s`: `%s`" % (key, count))
+
+    lines.extend(["", "## Semantic Equal Counts", ""])
+    if not summary.get("semantic_equal_counts"):
+        lines.append("No semantic-equal differences yet.")
+    else:
+        for key, count in summary["semantic_equal_counts"].items():
             lines.append("- `%s`: `%s`" % (key, count))
 
     lines.extend(["", "## Recent Mismatches", ""])

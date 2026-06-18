@@ -53,6 +53,180 @@ func TestNativeVMInfluxLabelMatchers(t *testing.T) {
 	assertNativeMatcher(t, matchers, "bk_biz_id", labels.MatchEqual, "2")
 }
 
+func TestConditionGroupsToNativeVMMatchersMultiValue(t *testing.T) {
+	tests := []struct {
+		name      string
+		cond      ConditionField
+		matchType labels.MatchType
+		value     string
+	}{
+		{
+			name: "eq multi values become exact regex union",
+			cond: ConditionField{
+				DimensionName: "bk_target_ip",
+				Operator:      ConditionEqual,
+				Value:         []string{"10.10.10.80", "10.10.10.81"},
+			},
+			matchType: labels.MatchRegexp,
+			value:     `(?:10\.10\.10\.80|10\.10\.10\.81)`,
+		},
+		{
+			name: "ne multi values become negative exact regex union",
+			cond: ConditionField{
+				DimensionName: "bk_target_ip",
+				Operator:      ConditionNotEqual,
+				Value:         []string{"10.10.10.80", "10.10.10.81"},
+			},
+			matchType: labels.MatchNotRegexp,
+			value:     `(?:10\.10\.10\.80|10\.10\.10\.81)`,
+		},
+		{
+			name: "contains multi values become literal substring regex union",
+			cond: ConditionField{
+				DimensionName: "bk_target_ip",
+				Operator:      ConditionContains,
+				Value:         []string{"10.10.10.80", "10.10.10.81"},
+			},
+			matchType: labels.MatchRegexp,
+			value:     `.*(?:10\.10\.10\.80|10\.10\.10\.81).*`,
+		},
+		{
+			name: "ncontains multi values become negative literal substring regex union",
+			cond: ConditionField{
+				DimensionName: "bk_target_ip",
+				Operator:      ConditionNotContains,
+				Value:         []string{"10.10.10.80", "10.10.10.81"},
+			},
+			matchType: labels.MatchNotRegexp,
+			value:     `.*(?:10\.10\.10\.80|10\.10\.10\.81).*`,
+		},
+		{
+			name: "req multi values become raw substring regex union",
+			cond: ConditionField{
+				DimensionName: "pod_name",
+				Operator:      ConditionRegEqual,
+				Value:         []string{"kube-apiserver", "kube-scheduler"},
+			},
+			matchType: labels.MatchRegexp,
+			value:     `.*(?:kube-apiserver|kube-scheduler).*`,
+		},
+		{
+			name: "nreq multi values become negative raw substring regex union",
+			cond: ConditionField{
+				DimensionName: "pod_name",
+				Operator:      ConditionNotRegEqual,
+				Value:         []string{"kube-apiserver", "kube-scheduler"},
+			},
+			matchType: labels.MatchNotRegexp,
+			value:     `.*(?:kube-apiserver|kube-scheduler).*`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			groups, err := conditionGroupsToNativeVMMatchers([][]ConditionField{{tt.cond}})
+			require.NoError(t, err)
+			require.Len(t, groups, 1)
+			require.Len(t, groups[0], 1)
+			require.Equal(t, tt.cond.DimensionName, groups[0][0].Name)
+			require.Equal(t, tt.matchType, groups[0][0].Type)
+			require.Equal(t, tt.value, groups[0][0].Value)
+		})
+	}
+}
+
+func TestConditionGroupsToNativeVMMatchersSubstringOpsHandleSingleAndMultiValuesConsistently(t *testing.T) {
+	tests := []struct {
+		name      string
+		cond      ConditionField
+		matchType labels.MatchType
+		value     string
+	}{
+		{
+			name: "contains single",
+			cond: ConditionField{
+				DimensionName: "label",
+				Operator:      ConditionContains,
+				Value:         []string{"a.b"},
+			},
+			matchType: labels.MatchRegexp,
+			value:     `.*(?:a\.b).*`,
+		},
+		{
+			name: "contains multi",
+			cond: ConditionField{
+				DimensionName: "label",
+				Operator:      ConditionContains,
+				Value:         []string{"a.b", "c.d"},
+			},
+			matchType: labels.MatchRegexp,
+			value:     `.*(?:a\.b|c\.d).*`,
+		},
+		{
+			name: "req single",
+			cond: ConditionField{
+				DimensionName: "label",
+				Operator:      ConditionRegEqual,
+				Value:         []string{"a.b"},
+			},
+			matchType: labels.MatchRegexp,
+			value:     `.*(?:a.b).*`,
+		},
+		{
+			name: "req multi",
+			cond: ConditionField{
+				DimensionName: "label",
+				Operator:      ConditionRegEqual,
+				Value:         []string{"a.b", "c.d"},
+			},
+			matchType: labels.MatchRegexp,
+			value:     `.*(?:a.b|c.d).*`,
+		},
+		{
+			name: "ncontains single",
+			cond: ConditionField{
+				DimensionName: "label",
+				Operator:      ConditionNotContains,
+				Value:         []string{"a.b"},
+			},
+			matchType: labels.MatchNotRegexp,
+			value:     `.*(?:a\.b).*`,
+		},
+		{
+			name: "ncontains empty string uses exact not equal",
+			cond: ConditionField{
+				DimensionName: "label",
+				Operator:      ConditionNotContains,
+				Value:         []string{""},
+			},
+			matchType: labels.MatchNotEqual,
+			value:     "",
+		},
+		{
+			name: "nreq single",
+			cond: ConditionField{
+				DimensionName: "label",
+				Operator:      ConditionNotRegEqual,
+				Value:         []string{"a.b"},
+			},
+			matchType: labels.MatchNotRegexp,
+			value:     `.*(?:a.b).*`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			groups, err := conditionGroupsToNativeVMMatchers([][]ConditionField{{tt.cond}})
+			require.NoError(t, err)
+			require.Len(t, groups, 1)
+			require.Len(t, groups[0], 1)
+			require.Equal(t, "label", groups[0][0].Name)
+			require.Equal(t, tt.matchType, groups[0][0].Type)
+			require.Equal(t, tt.value, groups[0][0].Value)
+		})
+	}
+}
+
 func TestNativeVMInfluxQueryMetadata(t *testing.T) {
 	ctx := context.Background()
 	storageID := "native-vm-influx-query-metadata"
@@ -254,13 +428,85 @@ func TestNativeVMInfluxQueryMetadataCombinesQueryAndFilterOrGroups(t *testing.T)
 	require.True(t, qry.NativeVMInflux)
 	require.Len(t, qry.NativeVMMatcherGroups, 4)
 	assertNativeMatcher(t, qry.NativeVMMatcherGroups[0], "bk_biz_id", labels.MatchEqual, "2")
-	assertNativeMatcher(t, qry.NativeVMMatcherGroups[0], "bcs_cluster_id", labels.MatchEqual, "cluster-a")
+	assertNativeMatcher(t, qry.NativeVMMatcherGroups[0], "bcs_cluster_id", labels.MatchRegexp, `.*(?:cluster-a).*`)
 	assertNativeMatcher(t, qry.NativeVMMatcherGroups[1], "bk_biz_id", labels.MatchEqual, "2")
-	assertNativeMatcher(t, qry.NativeVMMatcherGroups[1], "bcs_cluster_id", labels.MatchEqual, "cluster-b")
+	assertNativeMatcher(t, qry.NativeVMMatcherGroups[1], "bcs_cluster_id", labels.MatchRegexp, `.*(?:cluster-b).*`)
 	assertNativeMatcher(t, qry.NativeVMMatcherGroups[2], "bk_biz_id", labels.MatchEqual, "3")
-	assertNativeMatcher(t, qry.NativeVMMatcherGroups[2], "bcs_cluster_id", labels.MatchEqual, "cluster-a")
+	assertNativeMatcher(t, qry.NativeVMMatcherGroups[2], "bcs_cluster_id", labels.MatchRegexp, `.*(?:cluster-a).*`)
 	assertNativeMatcher(t, qry.NativeVMMatcherGroups[3], "bk_biz_id", labels.MatchEqual, "3")
-	assertNativeMatcher(t, qry.NativeVMMatcherGroups[3], "bcs_cluster_id", labels.MatchEqual, "cluster-b")
+	assertNativeMatcher(t, qry.NativeVMMatcherGroups[3], "bcs_cluster_id", labels.MatchRegexp, `.*(?:cluster-b).*`)
+}
+
+func TestNativeVMInfluxQueryMetadataUsesNativeVMMatchersForMultiValueAndFilterContains(t *testing.T) {
+	ctx := context.Background()
+	storageID := "native-vm-influx-query-multi-value"
+	spaceUid := "native-vm-multi-value-space"
+	tableID := "system.cpu_detail"
+	mock.SetOfflineDataArchiveMetadata(&m{})
+	reloadTestVMClusterInfo(t, "cluster-a")
+
+	tsdb.SetStorage(storageID, &tsdb.Storage{
+		Type:    consul.InfluxDBStorageType,
+		Address: "http://influxdb-proxy:8080",
+		Timeout: time.Minute,
+	})
+	mock.SetSpaceAndProxyMockData(
+		ctx,
+		"native_vm_influx_query_multi_value",
+		"native_vm_influx_query_multi_value",
+		spaceUid,
+		&redis.TsDB{
+			TableID:         tableID,
+			Field:           []string{"usage"},
+			MeasurementType: redis.BKTraditionalMeasurement,
+			Filters: []redis.Filter{
+				{"bcs_cluster_id": "cluster.a"},
+			},
+		},
+		&ir.Proxy{
+			MeasurementType: redis.BKTraditionalMeasurement,
+			StorageID:       storageID,
+			ClusterName:     "cluster-a",
+			Db:              "system",
+			Measurement:     "cpu_detail",
+		},
+	)
+
+	query := &Query{
+		TableID:       TableID(tableID),
+		FieldName:     "usage",
+		ReferenceName: "a",
+		Start:         "0",
+		End:           "60",
+		Step:          "60s",
+		Conditions: Conditions{
+			FieldList: []ConditionField{
+				{
+					DimensionName: "bk_target_ip",
+					Operator:      ConditionEqual,
+					Value:         []string{"10.10.10.80", "10.10.10.81"},
+				},
+				{
+					DimensionName: "pod_name",
+					Operator:      ConditionRegEqual,
+					Value:         []string{"kube-apiserver"},
+				},
+			},
+			ConditionList: []string{ConditionAnd},
+		},
+	}
+
+	queryMetric, err := query.ToQueryMetric(ctx, spaceUid)
+	require.NoError(t, err)
+	require.Len(t, queryMetric.QueryList, 1)
+
+	qry := queryMetric.QueryList[0]
+	require.True(t, qry.NativeVMInflux)
+	require.Len(t, qry.NativeVMMatcherGroups, 1)
+	assertNativeMatcher(t, qry.NativeVMMatcherGroups[0], "bk_target_ip", labels.MatchRegexp, `(?:10\.10\.10\.80|10\.10\.10\.81)`)
+	assertNativeMatcher(t, qry.NativeVMMatcherGroups[0], "pod_name", labels.MatchRegexp, `.*(?:kube-apiserver).*`)
+	assertNativeMatcher(t, qry.NativeVMMatcherGroups[0], "bcs_cluster_id", labels.MatchRegexp, `.*(?:cluster\.a).*`)
+	assertNativeMatcher(t, qry.NativeVMMatchers, "bcs_cluster_id", labels.MatchRegexp, `.*(?:cluster\.a).*`)
 }
 
 func TestQueryTsToNativeVMMetricQLIgnoresUnusedReferenceWithoutSelector(t *testing.T) {
