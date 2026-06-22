@@ -20,7 +20,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
 )
 
-func TestReloadTsDBStorageNativeVMInflux(t *testing.T) {
+func TestReloadTsDBStorageIgnoresNativeVMInfluxOptions(t *testing.T) {
 	err := ReloadTsDBStorage(context.Background(), map[string]*consul.Storage{
 		"native-vm-influx": {
 			Type:    consul.InfluxDBStorageType,
@@ -50,42 +50,9 @@ func TestReloadTsDBStorageNativeVMInflux(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, consul.InfluxDBStorageType, storage.Type)
 	assert.Equal(t, "http://vmselect:8481", storage.Address)
-	assert.True(t, storage.NativeVMInflux)
-	assert.Equal(t, "42", storage.NativeVMTenant)
-	assert.Equal(t, "/select/42/prometheus/api/v1", storage.NativeVMAPIPrefix)
-	assert.Equal(t, "db", storage.NativeVMDBLabel)
-	assert.Equal(t, "_", storage.NativeVMMeasurementFieldSeparator)
-	assert.True(t, storage.NativeVMSkipSingleField)
-}
 
-func TestReloadTsDBStorageNativeVMInfluxDefaults(t *testing.T) {
-	err := ReloadTsDBStorage(context.Background(), map[string]*consul.Storage{
-		"native-vm-influx-defaults": {
-			Type:    consul.InfluxDBStorageType,
-			Address: "http://vmselect:8481",
-			Options: map[string]string{
-				"native_vm_influx": "true",
-			},
-		},
-	}, &Options{
-		VM: &VMOption{
-			UriPath: "unused",
-			Timeout: time.Second,
-		},
-		InfluxDB: &InfluxDBOption{
-			Timeout:    time.Minute,
-			RawUriPath: "api/v1/raw/read",
-		},
-	})
-	require.NoError(t, err)
-
-	storage, err := GetStorage("native-vm-influx-defaults")
-	require.NoError(t, err)
-	assert.Equal(t, consul.InfluxDBStorageType, storage.Type)
-	assert.True(t, storage.NativeVMInflux)
-	assert.Equal(t, "0", storage.NativeVMTenant)
-	assert.Equal(t, "/select/0/prometheus/api/v1", storage.NativeVMAPIPrefix)
-	assert.Equal(t, "db", storage.NativeVMDBLabel)
-	assert.Equal(t, "_", storage.NativeVMMeasurementFieldSeparator)
-	assert.False(t, storage.NativeVMSkipSingleField)
+	printed := Print()
+	assert.NotContains(t, printed, "NativeVMInflux")
+	assert.NotContains(t, printed, "NativeVMAPIPrefix")
+	assert.NotContains(t, printed, "NativeVMDBLabel")
 }

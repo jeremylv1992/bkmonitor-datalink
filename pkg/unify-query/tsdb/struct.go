@@ -31,13 +31,6 @@ type Storage struct {
 	Accept         string
 	AcceptEncoding string
 
-	NativeVMInflux                    bool
-	NativeVMTenant                    string
-	NativeVMAPIPrefix                 string
-	NativeVMDBLabel                   string
-	NativeVMMeasurementFieldSeparator string
-	NativeVMSkipSingleField           bool
-
 	Instance Instance
 }
 
