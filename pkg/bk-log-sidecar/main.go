@@ -11,6 +11,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"net/http"
 	_ "net/http/pprof"
@@ -74,6 +75,13 @@ func main() {
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
+		os.Exit(1)
+	}
+
+	// 部署在 vcluster 内时，容器运行时标签记录的是宿主集群的 Pod 名称，需按容器 ID 反查 Pod
+	if err = mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{},
+		controllers.PodContainerIDIndexField, controllers.PodContainerIDIndexFunc); err != nil {
+		setupLog.Error(err, "unable to index pod container id")
 		os.Exit(1)
 	}
 

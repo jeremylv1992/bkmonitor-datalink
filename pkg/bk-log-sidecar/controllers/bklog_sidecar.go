@@ -27,6 +27,7 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/utils"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -35,6 +36,10 @@ import (
 )
 
 const SubscribeRetryInterval = 5 * time.Second
+
+// PodMatchRetryDelays 容器启动时暂未找到所属 Pod 的重试间隔
+// 部署在 vcluster 内时，容器启动事件可能早于 vcluster 把容器 ID 回写到 Pod 状态
+var PodMatchRetryDelays = []time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second, 30 * time.Second}
 
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
@@ -175,7 +180,7 @@ func (s *BkLogSidecar) allContainerBkLogConfigs(logConfigs []define.LogConfigTyp
 		c, ok := s.containerCache.Load(container.ID)
 		if ok {
 			containerInfo := castContainer(c)
-			logConfigs = s.containerBkLogConfigs(containerInfo, logConfigs, false)
+			logConfigs, _ = s.containerBkLogConfigs(containerInfo, logConfigs, false)
 			continue
 		}
 		containerInfo := s.containerByID(container.ID)
@@ -184,14 +189,15 @@ func (s *BkLogSidecar) allContainerBkLogConfigs(logConfigs []define.LogConfigTyp
 			continue
 		}
 		s.containerCache.Store(container.ID, containerInfo)
-		logConfigs = s.containerBkLogConfigs(containerInfo, logConfigs, false)
+		logConfigs, _ = s.containerBkLogConfigs(containerInfo, logConfigs, false)
 	}
 	return logConfigs
 }
 
 // containerBkLogConfigs will return single container all relation log config
-func (s *BkLogSidecar) containerBkLogConfigs(container *define.Container, logConfigs []define.LogConfigType, isNewContainer bool) []define.LogConfigType {
-	matchBklogConfigs, pod := s.matchBklogConfigs(container)
+// 第二个返回值表示 k8s 容器暂未找到所属 Pod
+func (s *BkLogSidecar) containerBkLogConfigs(container *define.Container, logConfigs []define.LogConfigType, isNewContainer bool) ([]define.LogConfigType, bool) {
+	matchBklogConfigs, pod, podNotFound := s.matchBklogConfigs(container)
 	for _, bkLogConfig := range matchBklogConfigs {
 		// 对于新增容器的场景，需要从头开始采集日志文件
 		bkLogConfig.Spec.TailFiles = !isNewContainer // stdout and stderr collect log from beginning
@@ -212,7 +218,7 @@ func (s *BkLogSidecar) containerBkLogConfigs(container *define.Container, logCon
 			RuntimeType: s.getRuntime().Type(),
 		})
 	}
-	return logConfigs
+	return logConfigs, podNotFound
 }
 
 // allContainers will all container info
@@ -265,17 +271,25 @@ func (s *BkLogSidecar) eventHandler(event *define.ContainerEvent) {
 func (s *BkLogSidecar) startActionHandler(event *define.ContainerEvent) {
 	s.log.Info(fmt.Sprintf("start handler [%s] for container [%s]", event.Type, event.ContainerID))
 
+	if s.applyStartedContainer(event) {
+		go s.retryStartedContainer(event)
+	}
+	s.log.Info(fmt.Sprintf("end handler [%s] for container [%s] done", event.Type, event.ContainerID))
+}
+
+// applyStartedContainer 为新启动的容器生成采集配置，返回是否因暂未找到所属 Pod 而需要稍后重试
+func (s *BkLogSidecar) applyStartedContainer(event *define.ContainerEvent) bool {
 	container := s.getContainerInfoByID(event.ContainerID)
 	if container == nil {
 		s.log.Info(fmt.Sprintf("container [%s] not exists, do nothing for action [%s].", event.ContainerID, event.Type))
-		return
+		return false
 	}
 
 	var bkLogConfigs []define.LogConfigType
-	bkLogConfigs = s.containerBkLogConfigs(container, bkLogConfigs, true)
+	bkLogConfigs, podNotFound := s.containerBkLogConfigs(container, bkLogConfigs, true)
 	if define.Empty(bkLogConfigs) {
 		s.log.Info(fmt.Sprintf("container [%s] not match log config", container.ID))
-		return
+		return podNotFound
 	}
 	for _, logConfig := range bkLogConfigs {
 		s.actualBkLogConfigCache.Store(logConfig.ConfigName(), logConfig)
@@ -284,7 +298,23 @@ func (s *BkLogSidecar) startActionHandler(event *define.ContainerEvent) {
 	utils.CheckErrorFn(s.reloadBkunifylogbeat(), func(err error) {
 		s.log.Error(err, "handler event reload agent failed")
 	})
-	s.log.Info(fmt.Sprintf("end handler [%s] for container [%s] done", event.Type, event.ContainerID))
+	return false
+}
+
+// retryStartedContainer 容器启动时暂未找到所属 Pod，按 PodMatchRetryDelays 间隔重试
+func (s *BkLogSidecar) retryStartedContainer(event *define.ContainerEvent) {
+	for i, delay := range PodMatchRetryDelays {
+		select {
+		case <-time.After(delay):
+		case <-s.stopCh:
+			return
+		}
+		if !s.applyStartedContainer(event) {
+			s.log.Info(fmt.Sprintf("container [%s] pod match retry [%d] done", event.ContainerID, i+1))
+			return
+		}
+	}
+	s.log.Info(fmt.Sprintf("container [%s] still not match pod after %d retries", event.ContainerID, len(PodMatchRetryDelays)))
 }
 
 // destroyActionHandler handler destroy event
@@ -451,34 +481,32 @@ func (s *BkLogSidecar) bkLogConfigList() ([]v1alpha1.BkLogConfig, error) {
 }
 
 // matchBklogConfigs get target config
-func (s *BkLogSidecar) matchBklogConfigs(container *define.Container) ([]v1alpha1.BkLogConfig, *corev1.Pod) {
+// 第三个返回值表示 k8s 容器暂未找到所属 Pod（如 vcluster 尚未把容器 ID 回写到 Pod 状态），调用方可稍后重试
+func (s *BkLogSidecar) matchBklogConfigs(container *define.Container) ([]v1alpha1.BkLogConfig, *corev1.Pod, bool) {
 	matchBkLogConfigs := make([]v1alpha1.BkLogConfig, 0)
 	var pod corev1.Pod
-	err := s.kubeClient.Get(context.Background(), client.ObjectKey{
-		Namespace: container.Labels[config.ContainerLabelK8sPodNamespace],
-		Name:      container.Labels[config.ContainerLabelK8sPodName],
-	}, &pod)
 
+	containerName, ok := container.Labels[config.ContainerLabelK8sContainerName]
+	if !ok {
+		s.log.Info("container is not k8s container")
+		return matchBkLogConfigs, &pod, false
+	}
+
+	s.log.Info(fmt.Sprintf("container name is [%s]", containerName))
+	if utils.IsNetworkPod(containerName) {
+		return matchBkLogConfigs, &pod, false
+	}
+
+	pod, err := s.getContainerPod(container)
 	if utils.NotNil(err) {
 		s.log.Error(err, "get container pod info failed")
-		return matchBkLogConfigs, &pod
+		return matchBkLogConfigs, &pod, apierrors.IsNotFound(err)
 	}
 
 	bkLogConfigs, err := s.bkLogConfigList()
 	if utils.NotNil(err) {
 		s.log.Error(err, "get bkLogConfig failed")
-		return matchBkLogConfigs, &pod
-	}
-
-	containerName, ok := container.Labels[config.ContainerLabelK8sContainerName]
-	if !ok {
-		s.log.Info("container is not k8s container")
-		return matchBkLogConfigs, &pod
-	}
-
-	s.log.Info(fmt.Sprintf("container name is [%s]", containerName))
-	if utils.IsNetworkPod(containerName) {
-		return matchBkLogConfigs, &pod
+		return matchBkLogConfigs, &pod, false
 	}
 
 	for _, bkLogConfig := range bkLogConfigs {
@@ -525,7 +553,48 @@ func (s *BkLogSidecar) matchBklogConfigs(container *define.Container) ([]v1alpha
 		s.log.Info(fmt.Sprintf("[%s] log config match container [%s]", bkLogConfig.Name, containerName))
 		matchBkLogConfigs = append(matchBkLogConfigs, bkLogConfig)
 	}
-	return matchBkLogConfigs, &pod
+	return matchBkLogConfigs, &pod, false
+}
+
+// getContainerPod 获取容器所属 Pod
+// 先按容器运行时标签中的 Pod 名称查询；部署在 vcluster 内时，标签记录的是宿主集群中的命名空间与 Pod 名称，
+// 当前集群查不到，此时按容器 ID 在本节点的 Pod 中反查
+func (s *BkLogSidecar) getContainerPod(container *define.Container) (corev1.Pod, error) {
+	var pod corev1.Pod
+	err := s.kubeClient.Get(context.Background(), client.ObjectKey{
+		Namespace: container.Labels[config.ContainerLabelK8sPodNamespace],
+		Name:      container.Labels[config.ContainerLabelK8sPodName],
+	}, &pod)
+	if !apierrors.IsNotFound(err) {
+		return pod, err
+	}
+
+	podByID, found, listErr := s.findPodByContainerID(container.ID)
+	if utils.NotNil(listErr) {
+		s.log.Error(listErr, fmt.Sprintf("find pod by container id [%s] failed", container.ID))
+		return pod, err
+	}
+	if !found {
+		return pod, err
+	}
+	s.log.Info(fmt.Sprintf("container [%s] match pod [%s/%s] by container id", container.ID, podByID.Namespace, podByID.Name))
+	return podByID, nil
+}
+
+// findPodByContainerID 按容器 ID 在 Pod 缓存索引中查找所属 Pod
+func (s *BkLogSidecar) findPodByContainerID(containerID string) (corev1.Pod, bool, error) {
+	if containerID == "" {
+		return corev1.Pod{}, false, nil
+	}
+	var pods corev1.PodList
+	err := s.kubeClient.List(context.Background(), &pods, client.MatchingFields{PodContainerIDIndexField: containerID})
+	if utils.NotNil(err) {
+		return corev1.Pod{}, false, err
+	}
+	if len(pods.Items) == 0 {
+		return corev1.Pod{}, false, nil
+	}
+	return pods.Items[0], true, nil
 }
 
 func (s *BkLogSidecar) matchLabel(matchSelector metav1.LabelSelector, matchLabels map[string]string) bool {
